@@ -1,0 +1,259 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 81f7ccd..abbb0a7 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -732,6 +732,11 @@ polaris_step_gmu_registers(void)
+ 	return second != first;
+ }
+ 
++static bool polaris_step_smmu_global(void);
++static bool polaris_step_smmu_contexts(void);
++static bool polaris_step_gmu_tcm_test(void);
++static bool polaris_step_gmu_firmware(void);
++
+ static void
+ polaris_gpu_write_probe(void)
+ {
+@@ -754,10 +759,242 @@ polaris_gpu_write_probe(void)
+ 	if (ok && level >= 6) {
+ 		ok = polaris_step_gmu_registers();
+ 	}
++	if (ok && level >= 7) {
++		ok = polaris_step_smmu_global();
++	}
++	if (ok && level >= 8) {
++		ok = polaris_step_smmu_contexts();
++	}
++	if (ok && level >= 9) {
++		ok = polaris_step_gmu_tcm_test();
++	}
++	if (ok && level >= 10) {
++		ok = polaris_step_gmu_firmware();
++	}
+ 	POLARIS_LOG("polaris-gpu: write probe level %d %s\n", level, ok ? "OK" : "stopped early");
+ 	polaris_log_barrier();
+ }
+ 
++/* ---- polaris P1b-3: SMMU, GMU memory test, GMU firmware (dipper steps 7-10) -------------
++ *
++ *   7  the GPU's SMMU (ARM SMMU v2): its global registers and stream table (reads)
++ *   8  its context banks (reads)
++ *   9  two words written into the GMU's instruction and data memory and read back
++ *  10  a630_gmu.bin written into the GMU's instruction memory and read back whole
++ *
++ * Gated by boot-arg polarisgpu=N: 7 stops after the global SMMU, 8 after the
++ * context banks, 9 after the memory test, 10 after the firmware.
++ */
++
++#define POLARIS_SMMU_PHYS             0x05040000UL
++#define POLARIS_SMMU_SIZE             0x00010000UL
++#define POLARIS_SMMU_SCR0             0x000
++#define POLARIS_SMMU_SCR1             0x004
++#define POLARIS_SMMU_SCR2             0x008
++#define POLARIS_SMMU_SACR             0x010
++#define POLARIS_SMMU_ID0              0x020
++#define POLARIS_SMMU_ID1              0x024
++#define POLARIS_SMMU_ID2              0x028
++#define POLARIS_SMMU_ID7              0x03c
++#define POLARIS_SMMU_SGFSR            0x048
++#define POLARIS_SMMU_SGFSYNR0         0x050
++#define POLARIS_SMMU_SMR(n)           (0x800 + 4 * (n))
++#define POLARIS_SMMU_S2CR(n)          (0xc00 + 4 * (n))
++#define POLARIS_SMMU_GR1              0x1000
++#define POLARIS_SMMU_CBAR(n)          (POLARIS_SMMU_GR1 + 4 * (n))
++#define POLARIS_SMMU_CBA2R(n)         (POLARIS_SMMU_GR1 + 0x800 + 4 * (n))
++#define POLARIS_CB_SCTLR              0x00
++#define POLARIS_CB_TCR2               0x10
++#define POLARIS_CB_TTBR0_LO           0x20
++#define POLARIS_CB_TTBR0_HI           0x24
++#define POLARIS_CB_TCR                0x30
++#define POLARIS_CB_MAIR0              0x38
++#define POLARIS_CB_FSR                0x58
++
++#define POLARIS_GMU_ITCM              POLARIS_GMU_WORD(0xc00)
++#define POLARIS_GMU_DTCM              POLARIS_GMU_WORD(0x1c00)
++#define POLARIS_GMU_TCM_SIZE          0x8000u
++
++static vm_offset_t polaris_smmu;
++static uint32_t polaris_smmu_pages_cb_base;
++static uint32_t polaris_smmu_page_size = 0x1000, polaris_smmu_num_cb, polaris_smmu_num_smr;
++
++/* step 7: the SMMU's global registers and stream table */
++static bool
++polaris_step_smmu_global(void)
++{
++	uint32_t id0, id1, n;
++
++	if (!polaris_cx_on || !polaris_gmu_clk_on) {
++		POLARIS_LOG("polaris-gpu: CX or GMU clock is off (steps 4, 5): SMMU not touched\n");
++		return false;
++	}
++	if (polaris_smmu == 0) {
++		polaris_smmu = ml_io_map(POLARIS_SMMU_PHYS, POLARIS_SMMU_SIZE);
++	}
++	id0 = polaris_rd(polaris_smmu + POLARIS_SMMU_ID0);
++	id1 = polaris_rd(polaris_smmu + POLARIS_SMMU_ID1);
++	POLARIS_LOG("polaris-gpu: step 7 SMMU sCR0 %#010x sCR1 %#010x sCR2 %#010x sACR %#010x\n",
++	    polaris_rd(polaris_smmu + POLARIS_SMMU_SCR0), polaris_rd(polaris_smmu + POLARIS_SMMU_SCR1),
++	    polaris_rd(polaris_smmu + POLARIS_SMMU_SCR2), polaris_rd(polaris_smmu + POLARIS_SMMU_SACR));
++	POLARIS_LOG("polaris-gpu: step 7 SMMU ID0 %#010x ID1 %#010x ID2 %#010x ID7 %#010x (architecture %u.%u)\n",
++	    id0, id1, polaris_rd(polaris_smmu + POLARIS_SMMU_ID2), polaris_rd(polaris_smmu + POLARIS_SMMU_ID7),
++	    (polaris_rd(polaris_smmu + POLARIS_SMMU_ID7) >> 4) & 15, polaris_rd(polaris_smmu + POLARIS_SMMU_ID7) & 15);
++	POLARIS_LOG("polaris-gpu: step 7 SMMU sGFSR %#010x sGFSYNR0 %#010x\n",
++	    polaris_rd(polaris_smmu + POLARIS_SMMU_SGFSR), polaris_rd(polaris_smmu + POLARIS_SMMU_SGFSYNR0));
++	polaris_smmu_num_smr = id0 & 0xff;
++	polaris_smmu_num_cb = id1 & 0xff;
++	polaris_smmu_page_size = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
++	polaris_smmu_pages_cb_base = (1u << (((id1 >> 28) & 7) + 1)) * polaris_smmu_page_size;
++	if (polaris_smmu_pages_cb_base + polaris_smmu_page_size * polaris_smmu_num_cb > POLARIS_SMMU_SIZE) {
++		POLARIS_LOG("polaris-gpu: context banks outside the SMMU registers (%#x + %u pages): stopping\n",
++		    polaris_smmu_pages_cb_base, polaris_smmu_num_cb);
++		return false;
++	}
++	POLARIS_LOG("polaris-gpu: step 7 SMMU: %u stream entries, %u context banks, page %u, banks from %#x "
++	    "(stage1 %s, stage2 %s, stream matching %s)\n",
++	    polaris_smmu_num_smr, polaris_smmu_num_cb, polaris_smmu_page_size, polaris_smmu_pages_cb_base,
++	    (id0 & (1u << 30)) ? "yes" : "no", (id0 & (1u << 29)) ? "yes" : "no",
++	    (id0 & (1u << 27)) ? "yes" : "no");
++	POLARIS_LOG("polaris-gpu: step 7 unmatched streams %s (sCR0.USFCFG %u)\n",
++	    (polaris_rd(polaris_smmu + POLARIS_SMMU_SCR0) & (1u << 10)) ? "FAULT" : "pass",
++	    (polaris_rd(polaris_smmu + POLARIS_SMMU_SCR0) >> 10) & 1);
++	for (n = 0; n < polaris_smmu_num_smr && n < 64; n++) {
++		uint32_t smr = polaris_rd(polaris_smmu + POLARIS_SMMU_SMR(n));
++		uint32_t s2cr = polaris_rd(polaris_smmu + POLARIS_SMMU_S2CR(n));
++
++		if ((smr & (1u << 31)) || s2cr != 0) {
++			POLARIS_LOG("polaris-gpu: step 7 stream %2u: SMR %#010x (id %#x mask %#x%s) S2CR %#010x (type %u, cb %u)\n",
++			    n, smr, smr & 0x7fff, (smr >> 16) & 0x7fff, (smr & (1u << 31)) ? ", valid" : "",
++			    s2cr, (s2cr >> 16) & 3, s2cr & 0xff);
++		}
++	}
++	polaris_log_barrier();
++	return true;
++}
++
++/* step 8: the context banks */
++static bool
++polaris_step_smmu_contexts(void)
++{
++	uint32_t n;
++	unsigned int used = 0;
++
++	if (polaris_smmu == 0) {
++		POLARIS_LOG("polaris-gpu: the SMMU was not read (step 7)\n");
++		return false;
++	}
++	POLARIS_LOG("polaris-gpu: step 8 reading %u context banks\n", polaris_smmu_num_cb);
++	polaris_log_barrier();
++	for (n = 0; n < polaris_smmu_num_cb && n < 32; n++) {
++		uint32_t cbar = polaris_rd(polaris_smmu + POLARIS_SMMU_CBAR(n));
++		vm_offset_t cb = polaris_smmu + polaris_smmu_pages_cb_base + polaris_smmu_page_size * n;
++
++		if (cbar == 0 && polaris_rd(cb + POLARIS_CB_SCTLR) == 0) {
++			continue;
++		}
++		used++;
++		POLARIS_LOG("polaris-gpu: step 8 cb %u: CBAR %#010x CBA2R %#010x SCTLR %#010x TTBR0 %#010x%08x TCR %#010x TCR2 %#010x MAIR0 %#010x FSR %#010x\n",
++		    n, cbar, polaris_rd(polaris_smmu + POLARIS_SMMU_CBA2R(n)), polaris_rd(cb + POLARIS_CB_SCTLR),
++		    polaris_rd(cb + POLARIS_CB_TTBR0_HI), polaris_rd(cb + POLARIS_CB_TTBR0_LO),
++		    polaris_rd(cb + POLARIS_CB_TCR), polaris_rd(cb + POLARIS_CB_TCR2),
++		    polaris_rd(cb + POLARIS_CB_MAIR0), polaris_rd(cb + POLARIS_CB_FSR));
++	}
++	POLARIS_LOG("polaris-gpu: step 8 %u of %u context banks in use\n", used, polaris_smmu_num_cb);
++	polaris_log_barrier();
++	return true;
++}
++
++/* step 9: two words into each of the GMU's memories and back */
++static bool
++polaris_step_gmu_tcm_test(void)
++{
++	static const uint32_t pattern[2] = { 0xa5a5a5a5u, 0x5a5a5a5au };
++	static const uint32_t offsets[2] = { POLARIS_GMU_ITCM, POLARIS_GMU_DTCM };
++	static const char *const names[2] = { "instruction memory", "data memory" };
++	bool good = true;
++	int m;
++
++	if (!polaris_gmu_clk_on) {
++		POLARIS_LOG("polaris-gpu: the GMU clock is not running (step 5): memory not touched\n");
++		return false;
++	}
++	if (polaris_gmu_base == 0) {
++		polaris_gmu_base = ml_io_map(POLARIS_GMU_PHYS, POLARIS_GMU_SIZE);
++	}
++	if (polaris_rd(polaris_gmu_base + POLARIS_GMU_WORD(0x5000)) != 1) {
++		POLARIS_LOG("polaris-gpu: the GMU is not held in reset (SYSRESET %#x): memory not touched\n",
++		    polaris_rd(polaris_gmu_base + POLARIS_GMU_WORD(0x5000)));
++		return false;
++	}
++	POLARIS_LOG("polaris-gpu: step 9 writing GMU ITCM/DTCM\n");
++	polaris_log_barrier();
++	for (m = 0; m < 2; m++) {
++		uint32_t old[2], back[2];
++
++		old[0] = polaris_rd(polaris_gmu_base + offsets[m]);
++		old[1] = polaris_rd(polaris_gmu_base + offsets[m] + 4);
++		polaris_wr(polaris_gmu_base + offsets[m], pattern[0]);
++		polaris_wr(polaris_gmu_base + offsets[m] + 4, pattern[1]);
++		back[0] = polaris_rd(polaris_gmu_base + offsets[m]);
++		back[1] = polaris_rd(polaris_gmu_base + offsets[m] + 4);
++		polaris_wr(polaris_gmu_base + offsets[m], old[0]);
++		polaris_wr(polaris_gmu_base + offsets[m] + 4, old[1]);
++		POLARIS_LOG("polaris-gpu: step 9 %s (%#x): was %#010x %#010x, wrote %#010x %#010x, back %#010x %#010x: %s\n",
++		    names[m], offsets[m], old[0], old[1], pattern[0], pattern[1], back[0], back[1],
++		    (back[0] == pattern[0] && back[1] == pattern[1]) ? "same" : "DIFFERENT");
++		good = good && back[0] == pattern[0] && back[1] == pattern[1];
++	}
++	polaris_log_barrier();
++	return good;
++}
++
++/* step 10: a630_gmu.bin into the GMU's instruction memory, then read it back */
++static bool
++polaris_step_gmu_firmware(void)
++{
++	uint64_t size = 0;
++	const uint32_t *fw;
++	uint32_t i, wrong = 0, sum = 0, first_wrong = 0;
++
++	if (polaris_gmu_base == 0) {
++		POLARIS_LOG("polaris-gpu: the GMU memory was not tried (step 9)\n");
++		return false;
++	}
++	fw = (const uint32_t *)polaris_fw_blob("a630_gmu.bin", &size);
++	if (fw == NULL) {
++		POLARIS_LOG("polaris-gpu: a630_gmu.bin is not in /chosen/memory-map: stopping\n");
++		return false;
++	}
++	POLARIS_LOG("polaris-gpu: step 10 a630_gmu.bin %llu bytes, first words %08x %08x %08x %08x\n", size,
++	    fw[0], fw[1], fw[2], fw[3]);
++	if (size == 0 || size > POLARIS_GMU_TCM_SIZE || (size & 3)) {
++		POLARIS_LOG("polaris-gpu: size not usable by the GMU (up to %#x, whole words): stopping\n",
++		    POLARIS_GMU_TCM_SIZE);
++		return false;
++	}
++	polaris_log_barrier();
++	for (i = 0; i < size / 4; i++) {
++		polaris_wr(polaris_gmu_base + POLARIS_GMU_ITCM + 4 * i, fw[i]);
++		sum += fw[i];
++	}
++	for (i = 0; i < size / 4; i++) {
++		if (polaris_rd(polaris_gmu_base + POLARIS_GMU_ITCM + 4 * i) != fw[i]) {
++			if (wrong++ == 0) {
++				first_wrong = i;
++			}
++		}
++	}
++	POLARIS_LOG("polaris-gpu: step 10 firmware in the GMU's memory (word sum %#010x): %u of %llu words wrong%s\n",
++	    sum, wrong, size / 4, wrong ? "" : " -- all of it read back as written");
++	if (wrong) {
++		POLARIS_LOG("polaris-gpu: step 10 first wrong word %u: %#010x, should be %#010x\n", first_wrong,
++		    polaris_rd(polaris_gmu_base + POLARIS_GMU_ITCM + 4 * first_wrong), fw[first_wrong]);
++	}
++	polaris_log_barrier();
++	return wrong == 0;
++}
++
+ void
+ PE_init_iokit(void)
+ {
