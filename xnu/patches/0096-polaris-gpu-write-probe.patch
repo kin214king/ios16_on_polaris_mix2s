@@ -1,5 +1,5 @@
 diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
-index 11d23b5..a3b7104 100644
+index 11d23b5..81f7ccd 100644
 --- a/pexpert/arm/pe_init.c
 +++ b/pexpert/arm/pe_init.c
 @@ -370,6 +370,8 @@ polaris_rpmh_address(const struct polaris_cmd_db_header *db, const char *name)
@@ -27,7 +27,7 @@ index 11d23b5..a3b7104 100644
  	for (i = 0; i < sizeof(gpucc_regs) / sizeof(gpucc_regs[0]); i++) {
  		value = polaris_rd(gpucc + gpucc_regs[i].reg);
  		printf("polaris-gpu: GPUCC %-26s %#06x = %#010x%s\n", gpucc_regs[i].name,
-@@ -476,6 +480,283 @@ polaris_gpu_read_probe(void)
+@@ -476,6 +480,284 @@ polaris_gpu_read_probe(void)
  	printf("polaris-gpu: read-only probe done\n");
  }
  
@@ -71,6 +71,7 @@ index 11d23b5..a3b7104 100644
 +extern void delay_for_interval(uint32_t interval, uint32_t scale);
 +extern uint64_t mach_absolute_time(void);
 +extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
++extern int snprintf(char *buf, size_t size, const char *format, ...);
 +
 +#ifndef NSEC_PER_USEC
 +#define NSEC_PER_USEC 1000ull
@@ -311,7 +312,7 @@ index 11d23b5..a3b7104 100644
  void
  PE_init_iokit(void)
  {
-@@ -516,6 +797,7 @@ PE_init_iokit(void)
+@@ -516,6 +798,7 @@ PE_init_iokit(void)
  
  	polaris_fw_probe();
  	polaris_gpu_read_probe();
