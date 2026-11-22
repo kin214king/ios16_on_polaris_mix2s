@@ -1,0 +1,60 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index c622b4c..9b8b994 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -232,6 +232,46 @@ PE_initialize_console(PE_Video * info, int op)
+ 	return 0;
+ }
+ 
++/*
++ * polaris P1a: prove the kernel can see the firmware blobs that mkpayload.py
++ * --blob placed in the payload.  Each blob is one /chosen/memory-map entry
++ * named after the file, with a DTMemoryMapRange { paddr, length } value.
++ */
++static void
++polaris_fw_probe(void)
++{
++	DTEntry			mmap;
++	OpaqueDTPropertyIterator iter;
++	char const		*name;
++	int			found = 0;
++
++	if (SecureDTLookupEntry(0, "/chosen/memory-map", &mmap) != kSuccess) {
++		printf("polaris-fw: no /chosen/memory-map\n");
++		return;
++	}
++	if (SecureDTInitPropertyIterator(mmap, &iter) != kSuccess) {
++		printf("polaris-fw: property iterator failed\n");
++		return;
++	}
++	while (SecureDTIterateProperties(&iter, &name) == kSuccess) {
++		void const	*value;
++		unsigned int	size;
++
++		if (SecureDTGetProperty(mmap, name, &value, &size) != kSuccess) {
++			continue;
++		}
++		if (size != sizeof(DTMemoryMapRange)) {
++			continue;
++		}
++		const DTMemoryMapRange *range = (const DTMemoryMapRange *)value;
++
++		printf("polaris-fw: %s pa=%#llx size=%lu\n", name,
++		    (unsigned long long)range->paddr, (unsigned long)range->length);
++		found++;
++	}
++	printf("polaris-fw: %d memory-map ranges\n", found);
++}
++
+ void
+ PE_init_iokit(void)
+ {
+@@ -270,6 +310,8 @@ PE_init_iokit(void)
+ 		}
+ 	}
+ 
++	polaris_fw_probe();
++
+ 	pe_prepare_images();
+ 
+ 	scale = PE_state.video.v_scale;
