@@ -1,0 +1,223 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 9b8b994..11d23b5 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -272,6 +272,210 @@ polaris_fw_probe(void)
+ 	printf("polaris-fw: %d memory-map ranges\n", found);
+ }
+ 
++/* ---- polaris P1b-1: read-only GPU probe ------------------------------------------------
++ *
++ * The first three steps of the Adreno 630 bring-up that dipper-xnu (Mi 8, same
++ * SDM845 and same A630) performs, with its addresses and register offsets:
++ *   1  the branches in the global clock controller (GCC) that feed the GPU
++ *   2  the names RPMh knows the GPU's supplies by, in the boot loader's cmd-db
++ *   3  the GPU's own clock controller (GPUCC) and its two power switches (GDSC)
++ *
++ * Nothing here writes a register.  Step 3 is skipped when gcc_gpu_cfg_ahb_clk is
++ * off, because an access to an unclocked GPUCC can hang the bus.
++ * Runs only with boot-arg: polarisgpu=1
++ */
++
++#define POLARIS_GCC_PHYS         0x00100000UL
++#define POLARIS_GCC_SIZE         0x001f0000UL
++#define POLARIS_GPUCC_PHYS       0x05090000UL
++#define POLARIS_GPUCC_SIZE       0x00009000UL
++#define POLARIS_CMDDB_PHYS       0x85fe0000UL
++#define POLARIS_CMDDB_SIZE       0x00020000UL
++#define POLARIS_CBCR_OFF         (1u << 31)
++#define POLARIS_GDSC_PWR_ON      (1u << 31)
++#define POLARIS_GCC_APPS_VOTE_0  0x52004
++#define POLARIS_GCC_GPU_CFG_AHB  0x71004
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++static uint32_t
++polaris_rd(vm_offset_t address)
++{
++	uint32_t value;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++/* One /chosen/memory-map entry, mapped; the payload's --blob files live there. */
++static const void *
++polaris_fw_blob(const char *name, uint64_t *size_out)
++{
++	DTEntry			mmap;
++	void const		*value = NULL;
++	unsigned int		size = 0;
++	const DTMemoryMapRange	*range;
++
++	if (SecureDTLookupEntry(0, "/chosen/memory-map", &mmap) != kSuccess ||
++	    SecureDTGetProperty(mmap, name, &value, &size) != kSuccess ||
++	    size != sizeof(DTMemoryMapRange)) {
++		return NULL;
++	}
++	range = (const DTMemoryMapRange *)value;
++	if (size_out != NULL) {
++		*size_out = range->length;
++	}
++	return (const void *)ml_io_map((vm_offset_t)range->paddr, (vm_size_t)range->length);
++}
++
++struct polaris_cmd_db_slave {
++	uint16_t id, header_offset, data_offset, count, version, reserved[3];
++};
++struct polaris_cmd_db_header {
++	uint32_t version;
++	uint8_t magic[4];
++	struct polaris_cmd_db_slave slave[8];
++	uint32_t checksum, reserved;
++	uint8_t data[];
++};
++struct polaris_cmd_db_entry {
++	char id[8];
++	uint32_t priority[2];
++	uint32_t address;
++	uint16_t length, offset;
++};
++
++static uint32_t
++polaris_rpmh_address(const struct polaris_cmd_db_header *db, const char *name)
++{
++	char id[8] = { 0 };
++	unsigned int s, i;
++
++	strlcpy(id, name, sizeof(id));
++	for (s = 0; s < 8; s++) {
++		const struct polaris_cmd_db_slave *slave = &db->slave[s];
++		const struct polaris_cmd_db_entry *entry;
++
++		if (slave->id == 0 || slave->header_offset >= POLARIS_CMDDB_SIZE - 0x1000 ||
++		    slave->count > 512) {
++			continue;
++		}
++		entry = (const struct polaris_cmd_db_entry *)(db->data + slave->header_offset);
++		for (i = 0; i < slave->count; i++) {
++			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
++				return entry[i].address;
++			}
++		}
++	}
++	return 0;
++}
++
++static void
++polaris_gpu_read_probe(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t reg;
++	} gcc_branches[] = {
++		{ "gcc_gpu_cfg_ahb_clk", 0x71004 },
++		{ "gcc_gpu_memnoc_gfx_clk", 0x7100c },
++		{ "gcc_gpu_snoc_dvm_gfx_clk", 0x71018 },
++		{ "gcc_gpu_iref_clk", 0x8c010 },
++		{ "gcc_gpu_vs_clk", 0x7a04c },
++		{ "gcc_ddrss_gpu_axi_clk", 0x44038 },
++	};
++	static const struct {
++		const char *name;
++		uint32_t reg;
++	} gpucc_regs[] = {
++		{ "GX GDSCR (gpu_gx_gdsc)", 0x100c },
++		{ "CX GDSCR (gpu_cx_gdsc)", 0x106c },
++		{ "gpu_cc_cx_gmu_clk CBCR", 0x1098 },
++		{ "gpu_cc_cxo_clk CBCR", 0x109c },
++		{ "GMU clock source RCG CMD", 0x1120 },
++		{ "GMU clock source RCG CFG", 0x1124 },
++		{ "CX GDSC hardware control", 0x1540 },
++		{ "GX clamp IO control", 0x1508 },
++	};
++	static const char *const rpmh_names[] = {
++		"cx.lvl", "mx.lvl", "gfx.lvl", "gmx.lvl", "ldoa17", "vddcx", "vddgfx"
++	};
++	vm_offset_t		gcc, gpucc, cmddb;
++	uint32_t		votes, value;
++	bool			ahb_on = false;
++	uint64_t		fw_size = 0;
++	const uint32_t		*gmu;
++	unsigned int		i;
++	int			level = 0;
++
++	if (!PE_parse_boot_argn("polarisgpu", &level, sizeof(level)) || level < 1) {
++		return;
++	}
++	printf("polaris-gpu: read-only probe (dipper steps 1-3), level %d\n", level);
++
++	gmu = (const uint32_t *)polaris_fw_blob("a630_gmu.bin", &fw_size);
++	if (gmu != NULL && fw_size >= 16) {
++		printf("polaris-gpu: a630_gmu.bin mapped at %p, %llu bytes, first words %08x %08x %08x %08x\n",
++		    gmu, (unsigned long long)fw_size, gmu[0], gmu[1], gmu[2], gmu[3]);
++	} else {
++		printf("polaris-gpu: a630_gmu.bin not in /chosen/memory-map (or empty)\n");
++	}
++
++	/* step 1: GCC branches that feed the GPU */
++	gcc = ml_io_map(POLARIS_GCC_PHYS, POLARIS_GCC_SIZE);
++	for (i = 0; i < sizeof(gcc_branches) / sizeof(gcc_branches[0]); i++) {
++		value = polaris_rd(gcc + gcc_branches[i].reg);
++		printf("polaris-gpu: %-26s %#07x = %#010x: %s\n", gcc_branches[i].name,
++		    gcc_branches[i].reg, value, (value & POLARIS_CBCR_OFF) ? "OFF" : "on");
++		if (gcc_branches[i].reg == POLARIS_GCC_GPU_CFG_AHB) {
++			ahb_on = (value & POLARIS_CBCR_OFF) == 0;
++		}
++	}
++	votes = polaris_rd(gcc + POLARIS_GCC_APPS_VOTE_0);
++	printf("polaris-gpu: apps votes %#x = %#010x: GPLL0 to the GPU %s, its /2 %s\n",
++	    POLARIS_GCC_APPS_VOTE_0, votes, (votes & (1u << 15)) ? "voted" : "not voted",
++	    (votes & (1u << 16)) ? "voted" : "not voted");
++
++	/* step 2: RPMh command database */
++	cmddb = ml_io_map(POLARIS_CMDDB_PHYS, POLARIS_CMDDB_SIZE);
++	{
++		const struct polaris_cmd_db_header *db = (const struct polaris_cmd_db_header *)cmddb;
++
++		if (db->magic[0] != 0xdb || db->magic[1] != 0x30 ||
++		    db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
++			printf("polaris-gpu: no RPMh cmd-db at %#lx (magic %02x %02x %02x %02x)\n",
++			    POLARIS_CMDDB_PHYS, db->magic[0], db->magic[1], db->magic[2], db->magic[3]);
++		} else {
++			for (i = 0; i < sizeof(rpmh_names) / sizeof(rpmh_names[0]); i++) {
++				uint32_t address = polaris_rpmh_address(db, rpmh_names[i]);
++
++				if (address != 0) {
++					printf("polaris-gpu: RPMh resource \"%s\" is at %#x\n",
++					    rpmh_names[i], address);
++				} else {
++					printf("polaris-gpu: RPMh knows no resource \"%s\"\n",
++					    rpmh_names[i]);
++				}
++			}
++		}
++	}
++
++	/* step 3: GPUCC + GDSC, only when the register bus is clocked */
++	if (!ahb_on) {
++		printf("polaris-gpu: gcc_gpu_cfg_ahb_clk is off: GPUCC not read\n");
++		return;
++	}
++	gpucc = ml_io_map(POLARIS_GPUCC_PHYS, POLARIS_GPUCC_SIZE);
++	for (i = 0; i < sizeof(gpucc_regs) / sizeof(gpucc_regs[0]); i++) {
++		value = polaris_rd(gpucc + gpucc_regs[i].reg);
++		printf("polaris-gpu: GPUCC %-26s %#06x = %#010x%s\n", gpucc_regs[i].name,
++		    gpucc_regs[i].reg, value,
++		    (gpucc_regs[i].reg == 0x100c || gpucc_regs[i].reg == 0x106c) ?
++		    ((value & POLARIS_GDSC_PWR_ON) ? ": power ON" : ": power off") : "");
++	}
++	printf("polaris-gpu: read-only probe done\n");
++}
++
+ void
+ PE_init_iokit(void)
+ {
+@@ -311,6 +515,7 @@ PE_init_iokit(void)
+ 	}
+ 
+ 	polaris_fw_probe();
++	polaris_gpu_read_probe();
+ 
+ 	pe_prepare_images();
+ 
