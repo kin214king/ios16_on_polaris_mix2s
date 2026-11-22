@@ -1,0 +1,321 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 11d23b5..a3b7104 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -370,6 +370,8 @@ polaris_rpmh_address(const struct polaris_cmd_db_header *db, const char *name)
+ 	return 0;
+ }
+ 
++static vm_offset_t polaris_gcc, polaris_gpucc;
++
+ static void
+ polaris_gpu_read_probe(void)
+ {
+@@ -423,6 +425,7 @@ polaris_gpu_read_probe(void)
+ 
+ 	/* step 1: GCC branches that feed the GPU */
+ 	gcc = ml_io_map(POLARIS_GCC_PHYS, POLARIS_GCC_SIZE);
++	polaris_gcc = gcc;
+ 	for (i = 0; i < sizeof(gcc_branches) / sizeof(gcc_branches[0]); i++) {
+ 		value = polaris_rd(gcc + gcc_branches[i].reg);
+ 		printf("polaris-gpu: %-26s %#07x = %#010x: %s\n", gcc_branches[i].name,
+@@ -466,6 +469,7 @@ polaris_gpu_read_probe(void)
+ 		return;
+ 	}
+ 	gpucc = ml_io_map(POLARIS_GPUCC_PHYS, POLARIS_GPUCC_SIZE);
++	polaris_gpucc = gpucc;
+ 	for (i = 0; i < sizeof(gpucc_regs) / sizeof(gpucc_regs[0]); i++) {
+ 		value = polaris_rd(gpucc + gpucc_regs[i].reg);
+ 		printf("polaris-gpu: GPUCC %-26s %#06x = %#010x%s\n", gpucc_regs[i].name,
+@@ -476,6 +480,283 @@ polaris_gpu_read_probe(void)
+ 	printf("polaris-gpu: read-only probe done\n");
+ }
+ 
++/* ---- polaris P1b-2: CX power, clocks, GMU registers (dipper steps 4-6) -------------------
++ *
++ * The first writes: gpu_cx_gdsc on, the two GCC branches that feed the GPU, the
++ * GMU's clock source and its two branches, then the GMU's registers (reads).
++ * Gated by boot-arg polarisgpu=N: 4 stops after the CX switch, 5 after the
++ * clocks, 6 after the GMU registers.
++ *
++ * Every line goes to the kernel's persistent console ring as well (patch 0047's
++ * sweet_log_append), and a barrier waits for that ring's once-a-second copy, so
++ * a step that hangs the machine still leaves its last line on the device.
++ */
++
++#define POLARIS_GPUCC_CX_GDSCR        0x106c
++#define POLARIS_GPUCC_CX_GDSC_HWCTRL  0x1540
++#define POLARIS_GDSCR_SW_COLLAPSE     (1u << 0)
++#define POLARIS_GDSCR_CLK_DIS_WAIT(x) ((uint32_t)(x) << 12)
++#define POLARIS_GDSCR_CLK_DIS_WAIT_MASK (0xfu << 12)
++#define POLARIS_CX_CLK_DIS_WAIT_VAL   8
++#define POLARIS_GDSC_POLL_US          2000
++
++#define POLARIS_GCC_GPU_MEMNOC_GFX    0x7100c
++#define POLARIS_GCC_GPU_SNOC_DVM_GFX  0x71018
++#define POLARIS_GPUCC_CX_GMU_CBCR     0x1098
++#define POLARIS_GPUCC_CXO_CBCR        0x109c
++#define POLARIS_GPUCC_GMU_RCG_CMD     0x1120
++#define POLARIS_GPUCC_GMU_RCG_CFG     0x1124
++#define POLARIS_CBCR_ENABLE           (1u << 0)
++#define POLARIS_RCG_CMD_UPDATE        (1u << 0)
++#define POLARIS_RCG_CMD_ROOT_EN       (1u << 1)
++#define POLARIS_RCG_CMD_ROOT_OFF      (1u << 31)
++#define POLARIS_CX_GMU_CBCR_WAKE_SLEEP ((0xfu << 8) | (0xfu << 4))
++
++#define POLARIS_GMU_PHYS              0x0506a000UL
++#define POLARIS_GMU_SIZE              0x00030000UL
++#define POLARIS_GMU_WORD(w)           ((w) * 4u)
++
++extern void sweet_log_append(const char *c, int size);
++extern void delay_for_interval(uint32_t interval, uint32_t scale);
++extern uint64_t mach_absolute_time(void);
++extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
++
++#ifndef NSEC_PER_USEC
++#define NSEC_PER_USEC 1000ull
++#endif
++#ifndef NSEC_PER_MSEC
++#define NSEC_PER_MSEC 1000000ull
++#endif
++
++/* printf to the console and to the persistent ring, in one shot. */
++#define POLARIS_LOG(fmt, ...) do {                                      \
++	char _pl[400];                                                  \
++	int _pn;                                                        \
++	printf(fmt, ##__VA_ARGS__);                                     \
++	_pn = snprintf(_pl, sizeof(_pl), fmt, ##__VA_ARGS__);           \
++	if (_pn >= (int)sizeof(_pl)) {                                  \
++		_pn = (int)sizeof(_pl) - 1;                             \
++	}                                                               \
++	if (_pn > 0) {                                                  \
++		sweet_log_append(_pl, _pn);                             \
++	}                                                               \
++} while (0)
++
++static inline void
++polaris_wr(vm_offset_t address, uint32_t value)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r" (value), "r" (address) : "memory");
++}
++
++static void
++polaris_sleep_us(uint32_t us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
++/* Waits for that once-a-second copy of the console ring, so the last line survives a hang. */
++static void
++polaris_log_barrier(void)
++{
++	delay_for_interval(1200, NSEC_PER_MSEC);
++}
++
++static vm_offset_t polaris_gmu_base;
++
++/* Waits for the power-on bit in gpu_cx_gdsc's hardware-control register. */
++static bool
++polaris_cx_wait(bool on)
++{
++	uint32_t waited;
++
++	for (waited = 0; waited <= POLARIS_GDSC_POLL_US; waited += 10) {
++		if (!!(polaris_rd(polaris_gpucc + POLARIS_GPUCC_CX_GDSC_HWCTRL) & POLARIS_GDSC_PWR_ON) == on) {
++			return true;
++		}
++		polaris_sleep_us(10);
++	}
++	return false;
++}
++
++/* Enables a branch (bit 0) and waits for its status bit (31: off) to say it runs. */
++static bool
++polaris_branch_enable(vm_offset_t base, uint32_t reg, const char *name)
++{
++	uint32_t waited;
++
++	polaris_wr(base + reg, polaris_rd(base + reg) | POLARIS_CBCR_ENABLE);
++	for (waited = 0; waited <= 1000; waited += 5) {
++		if (!(polaris_rd(base + reg) & POLARIS_CBCR_OFF)) {
++			POLARIS_LOG("polaris-gpu: %s on: %#010x\n", name, polaris_rd(base + reg));
++			return true;
++		}
++		polaris_sleep_us(5);
++	}
++	POLARIS_LOG("polaris-gpu: %s does not come on: %#010x\n", name, polaris_rd(base + reg));
++	return false;
++}
++
++static bool polaris_cx_on;
++
++/* step 4: gpu_cx_gdsc on, the way Linux's gdsc.c toggles it */
++static bool
++polaris_step_cx_on(void)
++{
++	uint32_t v;
++
++	if (polaris_gpucc == 0) {
++		POLARIS_LOG("polaris-gpu: GPUCC was not read (step 3): CX not touched\n");
++		return false;
++	}
++	v = polaris_rd(polaris_gpucc + POLARIS_GPUCC_CX_GDSCR);
++	POLARIS_LOG("polaris-gpu: step 4 CX GDSCR before %#010x, hardware control %#010x\n", v,
++	    polaris_rd(polaris_gpucc + POLARIS_GPUCC_CX_GDSC_HWCTRL));
++	polaris_log_barrier();
++	if (v & POLARIS_GDSC_PWR_ON) {
++		POLARIS_LOG("polaris-gpu: the CX switch is already on: not touched\n");
++		return false;
++	}
++	polaris_wr(polaris_gpucc + POLARIS_GPUCC_CX_GDSCR,
++	    (v & ~POLARIS_GDSCR_CLK_DIS_WAIT_MASK) | POLARIS_GDSCR_CLK_DIS_WAIT(POLARIS_CX_CLK_DIS_WAIT_VAL));
++	v = polaris_rd(polaris_gpucc + POLARIS_GPUCC_CX_GDSCR);
++	polaris_wr(polaris_gpucc + POLARIS_GPUCC_CX_GDSCR, v & ~POLARIS_GDSCR_SW_COLLAPSE);
++	polaris_sleep_us(1);
++	polaris_cx_on = polaris_cx_wait(true);
++	POLARIS_LOG("polaris-gpu: step 4 CX GDSCR after %#010x, hardware control %#010x: switch %s\n",
++	    polaris_rd(polaris_gpucc + POLARIS_GPUCC_CX_GDSCR),
++	    polaris_rd(polaris_gpucc + POLARIS_GPUCC_CX_GDSC_HWCTRL),
++	    polaris_cx_on ? "ON" : "STILL OFF (2 ms)");
++	polaris_log_barrier();
++	return polaris_cx_on;
++}
++
++static bool polaris_gmu_clk_on;
++
++/* step 5: the clocks of the CX half */
++static bool
++polaris_step_clocks(void)
++{
++	uint32_t v, waited;
++	bool done;
++
++	if (!polaris_cx_on) {
++		POLARIS_LOG("polaris-gpu: the CX switch is off (step 4): clocks not touched\n");
++		return false;
++	}
++	POLARIS_LOG("polaris-gpu: step 5 enabling gcc_gpu_memnoc_gfx_clk / snoc\n");
++	polaris_log_barrier();
++	if (!polaris_branch_enable(polaris_gcc, POLARIS_GCC_GPU_MEMNOC_GFX, "gcc_gpu_memnoc_gfx_clk") ||
++	    !polaris_branch_enable(polaris_gcc, POLARIS_GCC_GPU_SNOC_DVM_GFX, "gcc_gpu_snoc_dvm_gfx_clk")) {
++		polaris_log_barrier();
++		return false;
++	}
++	/* the GMU's clock source: crystal, undivided, then the update bit */
++	v = polaris_rd(polaris_gpucc + POLARIS_GPUCC_GMU_RCG_CFG);
++	polaris_wr(polaris_gpucc + POLARIS_GPUCC_GMU_RCG_CFG, v & ~((7u << 8) | 0x1fu));
++	polaris_wr(polaris_gpucc + POLARIS_GPUCC_GMU_RCG_CMD,
++	    polaris_rd(polaris_gpucc + POLARIS_GPUCC_GMU_RCG_CMD) | POLARIS_RCG_CMD_ROOT_EN | POLARIS_RCG_CMD_UPDATE);
++	done = false;
++	for (waited = 0; waited <= 1000 && !done; waited += 5) {
++		v = polaris_rd(polaris_gpucc + POLARIS_GPUCC_GMU_RCG_CMD);
++		done = !(v & POLARIS_RCG_CMD_UPDATE) && !(v & POLARIS_RCG_CMD_ROOT_OFF);
++		if (!done) {
++			polaris_sleep_us(5);
++		}
++	}
++	POLARIS_LOG("polaris-gpu: step 5 GMU clock source CMD %#010x CFG %#010x: %s\n",
++	    polaris_rd(polaris_gpucc + POLARIS_GPUCC_GMU_RCG_CMD),
++	    polaris_rd(polaris_gpucc + POLARIS_GPUCC_GMU_RCG_CFG),
++	    done ? "updated, root on" : "NOT UPDATED");
++	polaris_log_barrier();
++	if (!done) {
++		return false;
++	}
++	polaris_wr(polaris_gpucc + POLARIS_GPUCC_CX_GMU_CBCR,
++	    (polaris_rd(polaris_gpucc + POLARIS_GPUCC_CX_GMU_CBCR) & ~POLARIS_CX_GMU_CBCR_WAKE_SLEEP) |
++	    POLARIS_CX_GMU_CBCR_WAKE_SLEEP);
++	polaris_gmu_clk_on = polaris_branch_enable(polaris_gpucc, POLARIS_GPUCC_CXO_CBCR, "gpu_cc_cxo_clk") &&
++	    polaris_branch_enable(polaris_gpucc, POLARIS_GPUCC_CX_GMU_CBCR, "gpu_cc_cx_gmu_clk");
++	polaris_log_barrier();
++	return polaris_gmu_clk_on;
++}
++
++/* step 6: the GMU's registers; its always-on counter must be seen counting */
++static bool
++polaris_step_gmu_registers(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t word;
++	} regs[] = {
++		{ "GMU_CM3_SYSRESET", 0x5000 },
++		{ "GMU_CM3_BOOT_CONFIG", 0x5001 },
++		{ "GMU_CM3_FW_INIT_RESULT", 0x501c },
++		{ "GMU_CM3_CFG", 0x502d },
++		{ "GMU_CX_GMU_POWER_COUNTER_ENABLE", 0x5040 },
++		{ "GMU_GMU_PWR_COL_KEEPALIVE", 0x50c3 },
++		{ "GMU_RPMH_CTRL", 0x50e8 },
++		{ "GMU_HFI_CTRL_STATUS", 0x5180 },
++		{ "GMU_GENERAL_0", 0x51c5 },
++	};
++	vm_offset_t gmu;
++	uint32_t first, second, high;
++	uint64_t start, now, ns = 0;
++	unsigned int i;
++
++	if (!polaris_gmu_clk_on) {
++		POLARIS_LOG("polaris-gpu: the GMU clock is not running (step 5): GMU not read\n");
++		return false;
++	}
++	if (polaris_gmu_base == 0) {
++		polaris_gmu_base = ml_io_map(POLARIS_GMU_PHYS, POLARIS_GMU_SIZE);
++	}
++	gmu = polaris_gmu_base;
++	POLARIS_LOG("polaris-gpu: step 6 reading GMU registers\n");
++	polaris_log_barrier();
++	for (i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		POLARIS_LOG("polaris-gpu: GMU %-34s word %#06x = %#010x\n", regs[i].name, regs[i].word,
++		    polaris_rd(gmu + POLARIS_GMU_WORD(regs[i].word)));
++	}
++	first = polaris_rd(gmu + POLARIS_GMU_WORD(0x5088));
++	start = mach_absolute_time();
++	polaris_sleep_us(1000);
++	second = polaris_rd(gmu + POLARIS_GMU_WORD(0x5088));
++	now = mach_absolute_time();
++	high = polaris_rd(gmu + POLARIS_GMU_WORD(0x5089));
++	absolutetime_to_nanoseconds(now - start, &ns);
++	POLARIS_LOG("polaris-gpu: GMU always-on counter %u then %u (high %u) over %llu us: %llu kHz\n",
++	    first, second, high, ns / 1000,
++	    ns ? (uint64_t)(second - first) * 1000000 / ns : 0);
++	polaris_log_barrier();
++	return second != first;
++}
++
++static void
++polaris_gpu_write_probe(void)
++{
++	int level = 0;
++	bool ok;
++
++	if (!PE_parse_boot_argn("polarisgpu", &level, sizeof(level)) || level < 4) {
++		return;
++	}
++	POLARIS_LOG("polaris-gpu: write probe (dipper steps 4-6), level %d\n", level);
++	polaris_log_barrier();
++	if (polaris_gcc == 0 || polaris_gpucc == 0) {
++		POLARIS_LOG("polaris-gpu: GCC/GPUCC not mapped (steps 1-3 did not run): stopping\n");
++		return;
++	}
++	ok = polaris_step_cx_on();
++	if (ok && level >= 5) {
++		ok = polaris_step_clocks();
++	}
++	if (ok && level >= 6) {
++		ok = polaris_step_gmu_registers();
++	}
++	POLARIS_LOG("polaris-gpu: write probe level %d %s\n", level, ok ? "OK" : "stopped early");
++	polaris_log_barrier();
++}
++
+ void
+ PE_init_iokit(void)
+ {
+@@ -516,6 +797,7 @@ PE_init_iokit(void)
+ 
+ 	polaris_fw_probe();
+ 	polaris_gpu_read_probe();
++	polaris_gpu_write_probe();
+ 
+ 	pe_prepare_images();
+ 
