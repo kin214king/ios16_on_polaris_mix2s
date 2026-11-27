@@ -1,0 +1,127 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index a1297c2..e25300e 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -733,6 +733,7 @@ polaris_step_gmu_registers(void)
+ }
+ 
+ static bool polaris_step_rsc_pdc(void);
++static bool polaris_step_trustzone(void);
+ static bool polaris_step_smmu_global(void);
+ static bool polaris_step_smmu_contexts(void);
+ static bool polaris_step_gmu_tcm_test(void);
+@@ -775,6 +776,9 @@ polaris_gpu_write_probe(void)
+ 	if (ok && level >= 11) {
+ 		ok = polaris_step_rsc_pdc();
+ 	}
++	if (ok && level >= 13) {
++		ok = polaris_step_trustzone();
++	}
+ 	POLARIS_LOG("polaris-gpu: write probe level %d %s\n", level, ok ? "OK" : "stopped early");
+ 	polaris_log_barrier();
+ }
+@@ -1218,6 +1222,104 @@ polaris_step_rsc_pdc(void)
+ 	return ok;
+ }
+ 
++/* ---- polaris P1b-5: SCM / TrustZone queries (dipper step 13) ----------------------------
++ *
++ * The GPU's secure world: before anything can be authenticated (the zap firmware of
++ * step 22) the SCM calling convention has to be established and the PAS calls the
++ * kernel will later use must be advertised as available.  Everything here passes
++ * numbers only: no memory is handed to TrustZone.
++ *
++ * Gated by boot-arg polarisgpu=13 (steps 1-11 run first).
++ */
++
++#define POLARIS_SCM_FAST       (1ull << 31)
++#define POLARIS_SCM_64         (1ull << 30)
++#define POLARIS_SCM_SIP        (2ull << 24)
++#define POLARIS_SCM_AVAILABLE  0x601ull
++#define POLARIS_SCM_SUPPORTED  0x207ull
++
++static int32_t
++polaris_scm_query(uint64_t function, uint64_t argument, uint64_t *answer)
++{
++	uint64_t session = 0;
++	unsigned int i;
++
++	*answer = 0;
++	POLARIS_LOG("polaris-gpu: step 13 SCM query function %#llx arg %#llx (one value, no memory)\n",
++	    function, argument);
++	for (i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i ? 1 : function;
++		register uint64_t x1 __asm__("x1") = 1;
++		register uint64_t x2 __asm__("x2") = argument;
++		register uint64_t x3 __asm__("x3") = 0;
++		register uint64_t x4 __asm__("x4") = 0;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4),
++		    "+r" (x5), "+r" (x6), "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++		    "x16", "x17", "memory", "cc");
++		session = x6;
++		if (x0 != 1) {
++			*answer = x1;
++			POLARIS_LOG("polaris-gpu: step 13 SCM rc %d answer %#llx auxiliary %#llx/%#llx\n",
++			    (int32_t)x0, x1, x2, x3);
++			return (int32_t)x0;
++		}
++	}
++	POLARIS_LOG("polaris-gpu: step 13 SCM interrupted retry limit\n");
++	return -1;
++}
++
++/* step 13: the SCM convention and the PAS calls the secure load will need */
++static bool
++polaris_step_trustzone(void)
++{
++	static const uint32_t pas_queries[] = { 0x201, 0x202, 0x205, 0x206, 0x207 };
++	uint64_t how = POLARIS_SCM_FAST | POLARIS_SCM_64 | POLARIS_SCM_SIP, answer = 0;
++	bool available = true;
++	unsigned int i;
++
++	if (polaris_scm_query(how | POLARIS_SCM_AVAILABLE, POLARIS_SCM_SIP | POLARIS_SCM_AVAILABLE, &answer) ||
++	    answer != 1) {
++		how &= ~POLARIS_SCM_64;
++		if (polaris_scm_query(how | POLARIS_SCM_AVAILABLE,
++		    POLARIS_SCM_SIP | POLARIS_SCM_AVAILABLE, &answer) || answer != 1) {
++			POLARIS_LOG("polaris-gpu: step 13 SCM convention not established; no other calls\n");
++			return false;
++		}
++	}
++	POLARIS_LOG("polaris-gpu: step 13 SCM convention SMC%u\n", (how & POLARIS_SCM_64) ? 64 : 32);
++	polaris_log_barrier();
++
++	/* Linux uses ordinary calls after the atomic convention probe. */
++	how &= ~POLARIS_SCM_FAST;
++	for (i = 0; i < sizeof(pas_queries) / sizeof(pas_queries[0]); i++) {
++		if (polaris_scm_query(how | POLARIS_SCM_AVAILABLE, POLARIS_SCM_SIP | pas_queries[i], &answer) ||
++		    answer != 1) {
++			available = false;
++		}
++		POLARIS_LOG("polaris-gpu: step 13 PAS call %#x available answer %#llx\n", pas_queries[i], answer);
++	}
++	if (!available) {
++		POLARIS_LOG("polaris-gpu: step 13 required PAS calls not all available; no PAS request\n");
++		return false;
++	}
++	if (polaris_scm_query(how | POLARIS_SCM_SUPPORTED, 13, &answer)) {
++		return false;
++	}
++	POLARIS_LOG("polaris-gpu: step 13 PAS id 13 supported answer %#llx (no image supplied or authenticated)\n",
++	    answer);
++	if (answer > 1) {
++		return false;
++	}
++	POLARIS_LOG("polaris-gpu: step 13 SCM queries completed; zap authentication remains unverified (PAS_SUPPORTED=%llu)\n",
++	    answer);
++	polaris_log_barrier();
++	return true;
++}
++
+ void
+ PE_init_iokit(void)
+ {
