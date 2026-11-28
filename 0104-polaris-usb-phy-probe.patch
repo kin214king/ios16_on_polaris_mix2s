@@ -1,0 +1,143 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 5a5eff7..6c1bf80 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -736,6 +736,7 @@ static bool polaris_step_rsc_pdc(void);
+ static bool polaris_step_gmu_smmu(void);
+ static bool polaris_step_trustzone(void);
+ static bool polaris_step_gmu_prepare(void);
++static bool polaris_step_usb_phy(void);
+ static bool polaris_step_smmu_global(void);
+ static bool polaris_step_smmu_contexts(void);
+ static bool polaris_step_gmu_tcm_test(void);
+@@ -1884,6 +1885,116 @@ polaris_step_gmu_prepare(void)
+ 	polaris_log_barrier();
+ 	return ok;
+ }
++/* ---- polaris P1c-1: the QUSB2 PHY, first look (boot-arg polarisusb=1) ------------------
++ *
++ * The port's USB gadget (sweet_usb.c, patches 0072-0081) reads the PHY but never brings
++ * it up: on this phone the four QUSB2 registers come back as 0x64646464 / 0x23232323 /
++ * 0x72727272 / 0x90909090 -- the bus fill pattern of a block that is not clocked, so the
++ * DWC3 sees DSTS bit 0 = 0 (nothing attached) and no host sees the phone.
++ *
++ * This step does the minimum that can change that, and nothing more:
++ *   1. enable the two PHY clocks the port never touched (phy_aux 0xf04c,
++ *      phy_com_aux 0xf050) next to the ones it already uses,
++ *   2. pulse GCC_QUSB2PHY_PRIM_BCR (0x12000) so the PHY leaves reset,
++ *   3. read the four registers again and report whether they became real.
++ *
++ * No tuning values are written: those come next, once the block answers.
++ */
++
++#define POLARIS_USB_GCC_PHY_AUX        0x0f04c
++#define POLARIS_USB_GCC_PHY_COM_AUX    0x0f050
++#define POLARIS_USB_GCC_AHB2PHY        0x6a004
++#define POLARIS_USB_GCC_QUSB2_PRIM_BCR 0x12000
++#define POLARIS_USB_GCC_USB30_GDSCR    0x0f004
++#define POLARIS_USB_GCC_CBCR_ENABLE    (1u << 0)
++#define POLARIS_USB_GCC_CBCR_OFF       (1u << 31)
++
++#define POLARIS_QUSB2_PHYS             0x088e2000UL
++#define POLARIS_QUSB2_SIZE             0x400UL
++#define POLARIS_QUSB2_PLL_STATUS       0x1a0
++#define POLARIS_QUSB2_PWR_CTRL1        0x210
++#define POLARIS_QUSB2_PORT_TUNE1       0x240
++#define POLARIS_QUSB2_TEST1            0x254
++
++static bool
++polaris_usb_clock_on(vm_offset_t gcc, uint32_t reg, const char *name)
++{
++	uint32_t value = polaris_rd(gcc + reg);
++	int waited;
++
++	if (value & POLARIS_USB_GCC_CBCR_ENABLE) {
++		POLARIS_LOG("polaris-usb: %s already enabled (%#010x)\n", name, value);
++		return !(value & POLARIS_USB_GCC_CBCR_OFF);
++	}
++	polaris_wr(gcc + reg, value | POLARIS_USB_GCC_CBCR_ENABLE);
++	for (waited = 0; waited <= 2000; waited += 10) {
++		value = polaris_rd(gcc + reg);
++		if (!(value & POLARIS_USB_GCC_CBCR_OFF)) {
++			POLARIS_LOG("polaris-usb: %s enabled (%#010x)\n", name, value);
++			return true;
++		}
++		polaris_sleep_us(10);
++	}
++	POLARIS_LOG("polaris-usb: %s does not come on (%#010x)\n", name, polaris_rd(gcc + reg));
++	return false;
++}
++
++static bool
++polaris_step_usb_phy(void)
++{
++	vm_offset_t phy;
++	uint32_t before[4], after[4];
++	static const struct { uint32_t offset; const char *name; } regs[] = {
++		{ POLARIS_QUSB2_PLL_STATUS, "PLL_STATUS" },
++		{ POLARIS_QUSB2_PWR_CTRL1,  "PWR_CTRL1" },
++		{ POLARIS_QUSB2_PORT_TUNE1, "PORT_TUNE1" },
++		{ POLARIS_QUSB2_TEST1,      "TEST1" },
++	};
++	uint32_t dscr, i;
++	bool changed = false;
++
++	if (polaris_gcc == 0) {
++		POLARIS_LOG("polaris-usb: GCC is not mapped (step 1)\n");
++		return false;
++	}
++	dscr = polaris_rd(polaris_gcc + POLARIS_USB_GCC_USB30_GDSCR);
++	POLARIS_LOG("polaris-usb: USB30_PRIM GDSCR %#010x (%s)\n", dscr,
++	    (dscr & (1u << 31)) ? "power on" : "power off");
++
++	phy = ml_io_map(POLARIS_QUSB2_PHYS, POLARIS_QUSB2_SIZE);
++	for (i = 0; i < 4; i++) {
++		before[i] = polaris_rd(phy + regs[i].offset);
++	}
++	POLARIS_LOG("polaris-usb: before: PLL_STATUS %#010x PWR_CTRL1 %#010x PORT_TUNE1 %#010x TEST1 %#010x\n",
++	    before[0], before[1], before[2], before[3]);
++	polaris_log_barrier();
++
++	(void)polaris_usb_clock_on(polaris_gcc, POLARIS_USB_GCC_AHB2PHY, "ahb2phy");
++	(void)polaris_usb_clock_on(polaris_gcc, POLARIS_USB_GCC_PHY_AUX, "usb3_prim_phy_aux");
++	(void)polaris_usb_clock_on(polaris_gcc, POLARIS_USB_GCC_PHY_COM_AUX, "usb3_prim_phy_com_aux");
++
++	/* reset pulse: assert, hold, release, settle */
++	polaris_wr(polaris_gcc + POLARIS_USB_GCC_QUSB2_PRIM_BCR, 1);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	polaris_sleep_us(10000);
++	polaris_wr(polaris_gcc + POLARIS_USB_GCC_QUSB2_PRIM_BCR, 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	polaris_sleep_us(2000);
++	POLARIS_LOG("polaris-usb: QUSB2PHY_PRIM_BCR %#010x (0 = released)\n",
++	    polaris_rd(polaris_gcc + POLARIS_USB_GCC_QUSB2_PRIM_BCR));
++
++	for (i = 0; i < 4; i++) {
++		after[i] = polaris_rd(phy + regs[i].offset);
++		if (after[i] != before[i]) {
++			changed = true;
++		}
++		POLARIS_LOG("polaris-usb: %-10s before %#010x after %#010x%s\n", regs[i].name, before[i], after[i],
++		    (after[i] == before[i]) ? "" : "  (changed)");
++	}
++	POLARIS_LOG("polaris-usb: the PHY registers %s\n", changed ? "answer now" : "still return the same values");
++	polaris_log_barrier();
++	return changed;
++}
+ void
+ PE_init_iokit(void)
+ {
+@@ -1924,6 +2035,13 @@ PE_init_iokit(void)
+ 
+ 	polaris_fw_probe();
+ 	polaris_gpu_read_probe();
++	{
++		int polaris_usb = 0;
++
++		if (PE_parse_boot_argn("polarisusb", &polaris_usb, sizeof(polaris_usb)) && polaris_usb) {
++			polaris_step_usb_phy();
++		}
++	}
+ 	polaris_gpu_write_probe();
+ 
+ 	pe_prepare_images();
