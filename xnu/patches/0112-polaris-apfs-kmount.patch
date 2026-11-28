@@ -1,0 +1,273 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e17b8ea..2dfa15e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -165,6 +165,7 @@ bsd/miscfs/apfs/apfs_vnops.c		standard
+ bsd/miscfs/apfs/apfs_write.c		standard
+ bsd/miscfs/apfs/apfs_deflate.c		standard
+ bsd/miscfs/apfs/apfs_zbitmap.c		standard
++bsd/miscfs/apfs/apfs_kmount.c		standard
+ 
+ bsd/miscfs/devfs/devfs_tree.c		optional devfs
+ bsd/miscfs/devfs/devfs_vnops.c		optional devfs
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b69e938..7542236 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -406,6 +406,26 @@ sweet_ufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __
+ 	return 0;
+ }
+ 
++/*
++ * polaris M4: the APFS partition is a second device of the same driver (minor 1), so
++ * requests say which partition they mean.  Everything but that node is the root.
++ */
++#define SWEET_UFS_APFS_MINOR 1
++
++static uint64_t su_apfs_first, su_apfs_blocks;
++
++static void
++sweet_ufs_extents(dev_t dev, uint64_t *first, uint64_t *blocks)
++{
++	if (minor(dev) == SWEET_UFS_APFS_MINOR && su_apfs_blocks != 0) {
++		*first = su_apfs_first;
++		*blocks = su_apfs_blocks;
++	} else {
++		*first = su.first_block;
++		*blocks = su.nblocks;
++	}
++}
++
+ static void
+ sweet_ufs_strategy(buf_t bp)
+ {
+@@ -413,7 +433,11 @@ sweet_ufs_strategy(buf_t bp)
+ 	caddr_t vaddr = NULL;
+ 	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
+ 	uint32_t count = buf_count(bp);
+-	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++	uint64_t first, nblocks;
++	uint64_t part_bytes;
++
++	sweet_ufs_extents(buf_device(bp), &first, &nblocks);
++	part_bytes = nblocks * UFS_BLOCK;
+ 
+ 	bool rd = buf_flags(bp) & B_READ;
+ 
+@@ -443,18 +467,18 @@ sweet_ufs_strategy(buf_t bp)
+ 		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+ 		void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 		if (rd) {
+-			error = ufs_read_blocks(su.first_block + lba, blocks);
++			error = ufs_read_blocks(first + lba, blocks);
+ 			if (!error) {
+ 				memcpy(vaddr + done, (const char *)bounce + skip, want);
+ 			}
+ 		} else {
+ 			/* Partial device blocks at either end: read, merge, write back. */
+ 			if (skip || (want % UFS_BLOCK)) {
+-				error = ufs_read_blocks(su.first_block + lba, blocks);
++				error = ufs_read_blocks(first + lba, blocks);
+ 			}
+ 			if (!error) {
+ 				memcpy((char *)bounce + skip, vaddr + done, want);
+-				error = ufs_write_blocks(su.first_block + lba, blocks);
++				error = ufs_write_blocks(first + lba, blocks);
+ 			}
+ 		}
+ 		if (error) {
+@@ -474,7 +498,7 @@ done:
+ }
+ 
+ static int
+-sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++sweet_ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+     __unused struct proc *p, int is_char)
+ {
+ 	uint32_t *f = (uint32_t *)data;
+@@ -496,9 +520,13 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 	case DKIOCGETPHYSICALBLOCKSIZE:
+ 		*f = UFS_BLOCK;
+ 		return 0;
+-	case DKIOCGETBLOCKCOUNT:
+-		*o = su.nblocks * UFS_BLOCK / su.secsize;
++	case DKIOCGETBLOCKCOUNT: {
++		uint64_t first, nblocks;
++
++		sweet_ufs_extents(dev, &first, &nblocks);
++		*o = nblocks * UFS_BLOCK / su.secsize;
+ 		return 0;
++	}
+ 	case DKIOCISWRITABLE:
+ 		*f = su.writable;
+ 		return 0;
+@@ -540,9 +568,15 @@ sweet_ufs_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
+ }
+ 
+ static int
+-sweet_ufs_psize(__unused dev_t dev)
++sweet_ufs_psize(dev_t dev)
+ {
+-	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
++	uint64_t first, nblocks;
++
++	if (!su.ready) {
++		return -1;
++	}
++	sweet_ufs_extents(dev, &first, &nblocks);
++	return (int)MIN(nblocks * UFS_BLOCK / su.secsize, INT_MAX);
+ }
+ 
+ static int
+@@ -903,6 +937,42 @@ sweet_ufs_apfs_read(void *ctx, uint64_t off, void *buf, size_t len)
+ 	return 0;
+ }
+ 
++/*
++ * polaris M4: give a GPT partition a block device node of its own, for the APFS driver to
++ * open.  The root's extents are put back before returning, so the root device keeps
++ * working; the new node reads through sweet_ufs_extents().
++ */
++int
++sweet_ufs_apfs_node(const char *name, char *path, size_t pathlen)
++{
++	uint64_t root_first = su.first_block, root_blocks = su.nblocks;
++	dev_t dev;
++	int error;
++
++	if (!su.ready) {
++		return ENXIO;
++	}
++	error = ufs_find_partition(name);
++	if (error) {
++		return error;
++	}
++	su_apfs_first = su.first_block;
++	su_apfs_blocks = su.nblocks;
++	su.first_block = root_first;
++	su.nblocks = root_blocks;
++
++	dev = makedev(su.bmajor, SWEET_UFS_APFS_MINOR);
++	error = devfs_make_node(dev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "apfsroot0");
++	if (error) {
++		printf("POLARIS APFS: no device node for \"%s\": %d\n", name, error);
++		return error;
++	}
++	snprintf(path, pathlen, "/dev/apfsroot0");
++	printf("POLARIS APFS: \"%s\" = /dev/apfsroot0, %llu blocks of %u bytes\n",
++	    name, su_apfs_blocks, UFS_BLOCK);
++	return 0;
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 4df41ba..f51c3e1 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -979,6 +979,13 @@ bsd_init(void)
+ 	}
+ #endif /* DEVFS */
+ 
++	/* polaris M4: mount the APFS partition read only, once there is a place to mount it */
++	{
++		extern int polaris_apfs_mount(void);
++
++		(void)polaris_apfs_mount();
++	}
++
+ #if CONFIG_BASESYSTEMROOT
+ #if CONFIG_IMAGEBOOT
+ 	if (bsdmgroot_bootable()) {
+diff --git a/bsd/miscfs/apfs/apfs_kmount.c b/bsd/miscfs/apfs/apfs_kmount.c
+new file mode 100644
+index 0000000..246fccf
+--- /dev/null
++++ b/bsd/miscfs/apfs/apfs_kmount.c
+@@ -0,0 +1,85 @@
++/*
++ * polaris M4: mount the APFS partition as a filesystem, not just read it.
++ *
++ * The APFS driver takes the path of a block device as its mount data (see apfs_mount()
++ * in apfs_vfsops.c) and opens it itself, so all this needs is a device node whose
++ * blocks are the partition: sweet_ufs makes /dev/apfsroot0 for it, and the mount is
++ * the ordinary kernel_mount() the driver already supports.
++ *
++ * Called from bsd_init() once devfs and the root are up.  Gated by boot-arg
++ * polarisapfs=<partition name>; mounts read only, and looks the system version file up
++ * through the mount so the log says whether the filesystem really answers.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/mount.h>
++#include <sys/mount_internal.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <pexpert/pexpert.h>
++
++/* bsd/vfs/vfs_syscalls.c: the mount path of kernel mounts */
++extern int kernel_mount(const char *fstype, vnode_t pvp, vnode_t vp, const char *path,
++    void *data, size_t datalen, int syscall_flags, uint32_t kern_flags, vfs_context_t ctx);
++
++/* bsd/dev/sweet_ufs.c: makes the partition's device node, answers its path */
++extern int sweet_ufs_apfs_node(const char *name, char *path, size_t pathlen);
++
++/* Where the volume is mounted: the first of these that exists and is empty. */
++static const char *polaris_apfs_points[] = {
++	"/cores",
++	"/private/var/tmp",
++	"/private/var",
++	NULL,
++};
++
++int
++polaris_apfs_mount(void)
++{
++	char part[32] = "";
++	char dev[64] = "";
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int error, i;
++
++	if (!PE_parse_boot_argn("polarisapfs", part, sizeof(part)) || part[0] == 0) {
++		return 0;
++	}
++	error = sweet_ufs_apfs_node(part, dev, sizeof(dev));
++	if (error) {
++		printf("POLARIS APFS: partition \"%s\": %d\n", part, error);
++		return error;
++	}
++	for (i = 0; polaris_apfs_points[i] != NULL; i++) {
++		error = vnode_lookup(polaris_apfs_points[i], 0, &vp, ctx);
++		if (error == 0) {
++			vnode_put(vp);
++			vp = NULLVP;
++			break;
++		}
++	}
++	if (polaris_apfs_points[i] == NULL) {
++		printf("POLARIS APFS: no mount point (last error %d)\n", error);
++		return error;
++	}
++	error = kernel_mount("apfs", NULLVP, NULLVP, polaris_apfs_points[i], (void *)dev, 0,
++	    MNT_RDONLY, 0, ctx);
++	printf("POLARIS APFS: mount \"%s\" on %s -> %d\n", dev, polaris_apfs_points[i], error);
++	if (error != 0) {
++		return error;
++	}
++	{
++		char path[MAXPATHLEN];
++
++		snprintf(path, sizeof(path), "%s/System/Library/CoreServices/SystemVersion.plist",
++		    polaris_apfs_points[i]);
++		error = vnode_lookup(path, 0, &vp, ctx);
++		printf("POLARIS APFS: lookup %s through the mount -> %d\n", path, error);
++		if (error == 0) {
++			vnode_put(vp);
++		}
++	}
++	return error;
++}
