@@ -1,15 +1,15 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index dadd587..92256bf 100644
+index 15dfafc..455761b 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -158,6 +158,7 @@ bsd/miscfs/deadfs/dead_vnops.c		standard
- bsd/miscfs/devfs/devfs_fdesc_support.c	optional fdesc
- bsd/miscfs/fifofs/fifo_vnops.c		optional fifo sockets
- bsd/miscfs/specfs/spec_vnops.c		standard
+@@ -165,6 +165,7 @@ bsd/miscfs/apfs/apfs_vnops.c		standard
+ bsd/miscfs/apfs/apfs_write.c		standard
+ bsd/miscfs/apfs/apfs_deflate.c		standard
+ bsd/miscfs/apfs/apfs_zbitmap.c		standard
 +bsd/miscfs/apfs/apfs_probe.c		standard
+ bsd/libkern/zlib_stub.c			standard
  
  bsd/miscfs/devfs/devfs_tree.c		optional devfs
- bsd/miscfs/devfs/devfs_vnops.c		optional devfs
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 520b487..31f6645 100644
 --- a/bsd/dev/sweet_ufs.c
