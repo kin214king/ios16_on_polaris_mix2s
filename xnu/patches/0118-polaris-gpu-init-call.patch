@@ -1,0 +1,17 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -2044,6 +2044,13 @@
+ 	}
+ 	polaris_gpu_write_probe();
+ 
++	{
++		/* polaris P2: the Mi 8 A630 driver (bsd/dev/mi8_adreno.c); boot-arg mi8gpu=N says how far */
++		extern void mi8_adreno_init(void);
++
++		mi8_adreno_init();
++	}
++
+ 	pe_prepare_images();
+ 
+ 	scale = PE_state.video.v_scale;
