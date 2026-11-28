@@ -1,0 +1,109 @@
+diff --git a/bsd/miscfs/apfs/apfs_probe.c b/bsd/miscfs/apfs/apfs_probe.c
+--- a/bsd/miscfs/apfs/apfs_probe.c
++++ b/bsd/miscfs/apfs/apfs_probe.c
+@@ -6,8 +6,9 @@
+  * of one GPT partition.  Nothing of this goes through vnodes or the VFS, so it can run
+  * from the root-mount path before the mount table exists.
+  *
+- * The probe opens the container, opens its volumes, looks up "/" and lists the root
+- * directory's first entries.  Read only; it closes everything it opened.
++ * The probe opens the container, opens its volumes, looks up "/", lists the root
++ * directory, reads a symbolic link and reads the first bytes of a regular file.
++ * Read only; it closes everything it opened.
+  *
+  * Gated by boot-arg polarisapfs=<partition name> (see bsd/dev/sweet_ufs.c).
+  */
+@@ -20,6 +21,7 @@
+ 
+ #define APFS_PROBE_NAMES 8
+ #define APFS_PROBE_NAME_LEN 64
++#define APFS_PROBE_READ 256
+ 
+ struct apfs_probe_walk {
+ 	unsigned count;
+@@ -44,6 +46,76 @@
+ 	}
+ 	(void)file_id;
+ 	return 0;
++}
++
++/* A symbolic link's target, as the driver's readlink returns it. */
++static void
++apfs_probe_readlink(struct apfs_vol *vol, const char *path)
++{
++	char target[128];
++	size_t out = 0;
++	uint64_t file_id;
++	uint8_t d_type;
++	int error;
++
++	error = apfs_path_lookup(vol, path, &file_id, &d_type);
++	if (error) {
++		printf("apfs-probe: link %s: lookup: %d\n", path, error);
++		return;
++	}
++	error = apfs_readlink(vol, file_id, target, sizeof(target) - 1, &out);
++	if (error) {
++		printf("apfs-probe: link %s: readlink: %d\n", path, error);
++		return;
++	}
++	target[out] = 0;
++	printf("apfs-probe: link %s -> %s\n", path, target);
++}
++
++/* The first bytes of a regular file, through the compressed-file reader. */
++static void
++apfs_probe_readfile(struct apfs_vol *vol, const char *path)
++{
++	struct apfs_inode ino;
++	struct apfs_cfile cf;
++	char buf[APFS_PROBE_READ + 1];
++	size_t out = 0;
++	uint64_t file_id;
++	uint8_t d_type;
++	int error;
++	unsigned i;
++
++	error = apfs_path_lookup(vol, path, &file_id, &d_type);
++	if (error) {
++		printf("apfs-probe: file %s: lookup: %d\n", path, error);
++		return;
++	}
++	error = apfs_inode_get(vol, file_id, &ino);
++	if (error) {
++		printf("apfs-probe: file %s: inode_get: %d\n", path, error);
++		return;
++	}
++	memset(&cf, 0, sizeof(cf));
++	error = apfs_cfile_init(vol, &ino, &cf);
++	if (error) {
++		printf("apfs-probe: file %s: cfile_init: %d\n", path, error);
++		return;
++	}
++	error = apfs_read_file(vol, &ino, &cf, 0, buf, APFS_PROBE_READ, &out);
++	if (error) {
++		printf("apfs-probe: file %s: read_file: %d\n", path, error);
++		apfs_cfile_fini(&cf);
++		return;
++	}
++	buf[out] = 0;
++	for (i = 0; i < out; i++) {
++		if (buf[i] == '\n' || buf[i] == '\r') {
++			buf[i] = ' ';
++		}
++	}
++	printf("apfs-probe: file %s: %llu bytes, read %zu: \"%s\"\n",
++	    path, (unsigned long long)ino.size, out, buf);
++	apfs_cfile_fini(&cf);
+ }
+ 
+ /*
+@@ -111,6 +183,8 @@
+ 		for (k = 0; k < walk->kept; k++) {
+ 			printf("apfs-probe:   %-24s type %u\n", walk->names[k], walk->types[k]);
+ 		}
++		apfs_probe_readlink(vol, "/etc");
++		apfs_probe_readfile(vol, "/System/Library/CoreServices/SystemVersion.plist");
+ 	}
+ 
+ 	apfs_nx_close(nx);
