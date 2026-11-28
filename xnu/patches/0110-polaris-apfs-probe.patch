@@ -1,0 +1,233 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index dadd587..92256bf 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -158,6 +158,7 @@ bsd/miscfs/deadfs/dead_vnops.c		standard
+ bsd/miscfs/devfs/devfs_fdesc_support.c	optional fdesc
+ bsd/miscfs/fifofs/fifo_vnops.c		optional fifo sockets
+ bsd/miscfs/specfs/spec_vnops.c		standard
++bsd/miscfs/apfs/apfs_probe.c		standard
+ 
+ bsd/miscfs/devfs/devfs_tree.c		optional devfs
+ bsd/miscfs/devfs/devfs_vnops.c		optional devfs
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 520b487..31f6645 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -821,7 +821,7 @@ sweet_log_start(void)
+  * Boot-arg: polarisapfs=<partition name>, e.g. polarisapfs=iosroot.
+  */
+ static int
+-sweet_ufs_apfs_peek(const char *want)
++sweet_ufs_apfs_peek(const char *want, uint64_t *first_out)
+ {
+ 	uint64_t root_first = su.first_block, root_blocks = su.nblocks;
+ 	uint64_t first, blocks;
+@@ -838,6 +838,7 @@ sweet_ufs_apfs_peek(const char *want)
+ 	blocks = su.nblocks;
+ 	su.first_block = root_first;
+ 	su.nblocks = root_blocks;
++	*first_out = first;
+ 
+ 	error = ufs_read_blocks(first, 1);
+ 	if (error) {
+@@ -862,6 +863,43 @@ sweet_ufs_apfs_peek(const char *want)
+ 	return 1;
+ }
+ 
++/*
++ * Bytes of the probed partition for apfs_lib (bsd/miscfs/apfs/apfs_probe.c): whole
++ * buffers, block aligned.  ctx is that partition's first block.
++ */
++static int
++sweet_ufs_apfs_read(void *ctx, uint64_t off, void *buf, size_t len)
++{
++	uint64_t base = *(const uint64_t *)ctx;
++	uint8_t *out = buf;
++	int error;
++
++	if ((off & (UFS_BLOCK - 1)) != 0 || len == 0) {
++		return EINVAL;
++	}
++	while (len > 0) {
++		uint32_t blocks = (uint32_t)MIN(len / UFS_BLOCK, BOUNCE_SIZE / UFS_BLOCK);
++		size_t chunk;
++
++		if (blocks == 0) {
++			blocks = 1;             /* a partial tail block */
++		}
++		error = ufs_read_blocks(base + off / UFS_BLOCK, blocks);
++		if (error) {
++			return error;
++		}
++		chunk = (size_t)blocks * UFS_BLOCK;
++		if (chunk > len) {
++			chunk = len;
++		}
++		memcpy(out, (const void *)(su.dma + DMA_BOUNCE), chunk);
++		out += chunk;
++		off += chunk;
++		len -= chunk;
++	}
++	return 0;
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+@@ -876,12 +914,18 @@ sweet_ufs_rootdev(dev_t *dev)
+ 	}
+ 	{
+ 		char apfs[32] = "";
++		uint64_t apfs_first = 0;
+ 
+ 		if (PE_parse_boot_argn("polarisapfs", apfs, sizeof(apfs)) && apfs[0] != 0) {
+-			(void)sweet_ufs_apfs_peek(apfs);
++			if (sweet_ufs_apfs_peek(apfs, &apfs_first) == 1) {
++				(void)apfs_probe_run(sweet_ufs_apfs_read, &apfs_first);
++			}
+ 		}
+ 	}
+ 	*dev = su.bdev;
+ 	return 0;
+ }
++/* bsd/miscfs/apfs/apfs_probe.c */
++int apfs_probe_run(int (*read)(void *ctx, uint64_t off, void *buf, size_t len), void *ctx);
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/miscfs/apfs/apfs_probe.c b/bsd/miscfs/apfs/apfs_probe.c
+new file mode 100644
+index 0000000..ff5e812
+--- /dev/null
++++ b/bsd/miscfs/apfs/apfs_probe.c
+@@ -0,0 +1,130 @@
++/*
++ * polaris P1d-2: read an APFS container through the kernel's APFS library.
++ *
++ * The library (apfs_lib.c) knows the format and asks only for bytes: struct apfs_dev
++ * carries a read() that fills a whole buffer, which here is sweet_ufs reading blocks
++ * of one GPT partition.  Nothing of this goes through vnodes or the VFS, so it can run
++ * from the root-mount path before the mount table exists.
++ *
++ * The probe opens the container, opens its volumes, looks up "/" and lists the root
++ * directory's first entries.  Read only; it closes everything it opened.
++ *
++ * Gated by boot-arg polarisapfs=<partition name> (see bsd/dev/sweet_ufs.c).
++ */
++
++#include "apfs_lib.h"
++
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++
++#define APFS_PROBE_NAMES 8
++#define APFS_PROBE_NAME_LEN 64
++
++struct apfs_probe_walk {
++	unsigned count;
++	unsigned kept;
++	unsigned types[APFS_PROBE_NAMES];
++	char names[APFS_PROBE_NAMES][APFS_PROBE_NAME_LEN];
++};
++
++static int
++apfs_probe_dir_cb(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_t d_type)
++{
++	struct apfs_probe_walk *w = ctx;
++	size_t copy;
++
++	w->count++;
++	if (w->kept < APFS_PROBE_NAMES) {
++		copy = name_len < APFS_PROBE_NAME_LEN - 1 ? name_len : APFS_PROBE_NAME_LEN - 1;
++		memcpy(w->names[w->kept], name, copy);
++		w->names[w->kept][copy] = 0;
++		w->types[w->kept] = d_type;
++		w->kept++;
++	}
++	(void)file_id;
++	return 0;
++}
++
++/*
++ * The caller supplies the bytes: read() must fill the whole buffer and answer 0, or
++ * return an errno.  Offsets and lengths are in bytes, block aligned.
++ */
++int
++apfs_probe_run(int (*read)(void *ctx, uint64_t off, void *buf, size_t len), void *ctx)
++{
++	struct apfs_dev dev;
++	struct apfs_nx *nx;
++	struct apfs_vol *vol;
++	struct apfs_probe_walk *walk;
++	uint64_t file_id;
++	uint8_t d_type;
++	unsigned i, k;
++	int error;
++
++	memset(&dev, 0, sizeof(dev));
++	dev.ctx = ctx;
++	dev.size = 0;                   /* the library reads what it needs */
++	dev.read = read;
++	dev.read_data = NULL;
++	dev.write = NULL;
++
++	nx = kalloc_type(struct apfs_nx, Z_WAITOK | Z_ZERO);
++	vol = kalloc_type(struct apfs_vol, Z_WAITOK | Z_ZERO);
++	walk = kalloc_type(struct apfs_probe_walk, Z_WAITOK | Z_ZERO);
++	if (nx == NULL || vol == NULL || walk == NULL) {
++		printf("apfs-probe: out of memory\n");
++		error = ENOMEM;
++		goto out;
++	}
++
++	error = apfs_nx_open(nx, &dev);
++	if (error) {
++		printf("apfs-probe: apfs_nx_open: %d\n", error);
++		goto out;
++	}
++	printf("apfs-probe: container: block size %u, %llu blocks, xid %llu, %u file systems, uuid %02x%02x%02x%02x\n",
++	    nx->block_size, nx->block_count, nx->xid, nx->fs_count,
++	    nx->uuid[0], nx->uuid[1], nx->uuid[2], nx->uuid[3]);
++
++	for (i = 0; i < nx->fs_count && i < 4; i++) {
++		error = apfs_vol_open(nx, i, vol);
++		if (error) {
++			printf("apfs-probe: volume %u: apfs_vol_open: %d\n", i, error);
++			continue;
++		}
++		printf("apfs-probe: volume %u: oid %llu, role %u, incompat %#llx, hashed names %d\n",
++		    i, vol->oid, vol->role, vol->incompat, vol->hashed_names ? 1 : 0);
++		error = apfs_path_lookup(vol, "/", &file_id, &d_type);
++		if (error) {
++			printf("apfs-probe: volume %u: lookup \"/\": %d\n", i, error);
++			continue;
++		}
++		printf("apfs-probe: volume %u: \"/\" is id %llu type %u\n", i, file_id, d_type);
++		memset(walk, 0, sizeof(*walk));
++		error = apfs_readdir(vol, file_id, apfs_probe_dir_cb, walk);
++		if (error) {
++			printf("apfs-probe: volume %u: readdir: %d\n", i, error);
++			continue;
++		}
++		printf("apfs-probe: volume %u: root has %u entries\n", i, walk->count);
++		for (k = 0; k < walk->kept; k++) {
++			printf("apfs-probe:   %-24s type %u\n", walk->names[k], walk->types[k]);
++		}
++	}
++
++	apfs_nx_close(nx);
++	error = 0;
++
++out:
++	if (walk != NULL) {
++		kfree_type(struct apfs_probe_walk, walk);
++	}
++	if (vol != NULL) {
++		kfree_type(struct apfs_vol, vol);
++	}
++	if (nx != NULL) {
++		kfree_type(struct apfs_nx, nx);
++	}
++	return error;
++}
