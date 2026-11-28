@@ -1,0 +1,45 @@
+diff --git a/bsd/miscfs/apfs/apfs_deflate.c b/bsd/miscfs/apfs/apfs_deflate.c
+index 38a5e54..99eeb45 100644
+--- a/bsd/miscfs/apfs/apfs_deflate.c
++++ b/bsd/miscfs/apfs/apfs_deflate.c
+@@ -18,12 +18,25 @@
+ #define FREESTANDING 1
+ 
+ /*
+- * The kernel's include path has no <arm_neon.h>, so libdeflate's NEON paths are
+- * switched off here and its portable C is used instead (slower, same results).
++ * The kernel's include path has no <arm_neon.h> or <arm_acle.h>, so libdeflate's
++ * ARM intrinsics are switched off here and its portable C is used (slower, same
++ * results).  The compiler defines these macros for every aarch64 target.
+  */
+ #if defined(__ARM_NEON)
+ #undef __ARM_NEON
+ #endif
++#if defined(__ARM_FEATURE_CRC32)
++#undef __ARM_FEATURE_CRC32
++#endif
++#if defined(__ARM_FEATURE_CRYPTO)
++#undef __ARM_FEATURE_CRYPTO
++#endif
++#if defined(__ARM_FEATURE_SHA3)
++#undef __ARM_FEATURE_SHA3
++#endif
++#if defined(__ARM_FEATURE_DOTPROD)
++#undef __ARM_FEATURE_DOTPROD
++#endif
+ 
+ #include "libdeflate/lib/deflate_decompress.c"
+ #include "libdeflate/lib/zlib_decompress.c"
+diff --git a/bsd/miscfs/apfs/libdeflate/lib/arm/cpu_features.h b/bsd/miscfs/apfs/libdeflate/lib/arm/cpu_features.h
+index dc9ab8a..bc2160c 100644
+--- a/bsd/miscfs/apfs/libdeflate/lib/arm/cpu_features.h
++++ b/bsd/miscfs/apfs/libdeflate/lib/arm/cpu_features.h
+@@ -112,7 +112,7 @@ static inline u32 get_arm_cpu_features(void) { return 0; }
+ #else
+ #  define HAVE_CRC32(features)	((features) & ARM_CPU_FEATURE_CRC32)
+ #endif
+-#if defined(ARCH_ARM64) && \
++#if defined(ARCH_ARM64) && defined(APFS_ARM_INTRIN) && \
+ 	(defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
+ #  define HAVE_CRC32_INTRIN	1
+ #  if defined(__GNUC__) || defined(__clang__)
