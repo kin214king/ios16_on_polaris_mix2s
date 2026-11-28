@@ -1,0 +1,20 @@
+diff --git a/bsd/miscfs/apfs/apfs_kmount.c b/bsd/miscfs/apfs/apfs_kmount.c
+--- a/bsd/miscfs/apfs/apfs_kmount.c
++++ b/bsd/miscfs/apfs/apfs_kmount.c
+@@ -21,6 +21,7 @@
+ #include <sys/proc.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
++#include <mach/kern_return.h>
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
+ #include <kern/thread.h>
+@@ -48,6 +49,8 @@
+ };
+ 
+ static int polaris_apfs_chan;
++
++int polaris_apfs_start(void);
+ 
+ static int
+ polaris_apfs_mount(void)
