@@ -1,0 +1,100 @@
+diff --git a/bsd/miscfs/apfs/apfs_kmount.c b/bsd/miscfs/apfs/apfs_kmount.c
+--- a/bsd/miscfs/apfs/apfs_kmount.c
++++ b/bsd/miscfs/apfs/apfs_kmount.c
+@@ -6,9 +6,11 @@
+  * blocks are the partition: sweet_ufs makes /dev/apfsroot0 for it, and the mount is
+  * the ordinary kernel_mount() the driver already supports.
+  *
+- * Called from bsd_init() once devfs and the root are up.  Gated by boot-arg
+- * polarisapfs=<partition name>; mounts read only, and looks the system version file up
+- * through the mount so the log says whether the filesystem really answers.
++ * Started from bsd_init() as a thread that waits before touching anything: the mount
++ * happens while the system is already up, so the console log has been flushed to the
++ * partition and a failure here leaves its trace behind instead of taking the boot with
++ * it.  Gated by boot-arg polarisapfs=<partition name>; mounts read only, and looks the
++ * system version file up through the mount so the log says whether it answers.
+  */
+ 
+ #include <sys/param.h>
+@@ -16,8 +18,10 @@
+ #include <sys/errno.h>
+ #include <sys/mount.h>
+ #include <sys/mount_internal.h>
++#include <sys/proc.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
++#include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ 
+ /* bsd/vfs/vfs_syscalls.c: the mount path of kernel mounts */
+@@ -27,7 +31,10 @@
+ /* bsd/dev/sweet_ufs.c: makes the partition's device node, answers its path */
+ extern int sweet_ufs_apfs_node(const char *name, char *path, size_t pathlen);
+ 
+-/* Where the volume is mounted: the first of these that exists and is empty. */
++/* How long to let the system settle before mounting (seconds). */
++#define POLARIS_APFS_DELAY 15
++
++/* Where the volume is mounted: the first of these that exists. */
+ static const char *polaris_apfs_points[] = {
+ 	"/cores",
+ 	"/private/var/tmp",
+@@ -35,7 +42,9 @@
+ 	NULL,
+ };
+ 
+-int
++static int polaris_apfs_chan;
++
++static int
+ polaris_apfs_mount(void)
+ {
+ 	char part[32] = "";
+@@ -83,3 +92,28 @@
+ 	}
+ 	return error;
+ }
++
++static void
++polaris_apfs_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	(void)tsleep(&polaris_apfs_chan, PZERO, "apfsmnt", hz * POLARIS_APFS_DELAY);
++	(void)polaris_apfs_mount();
++	thread_terminate(current_thread());
++}
++
++int
++polaris_apfs_start(void)
++{
++	char part[32] = "";
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("polarisapfs", part, sizeof(part)) || part[0] == 0) {
++		return 0;
++	}
++	if (kernel_thread_start(polaris_apfs_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("POLARIS APFS: no thread for the mount\n");
++		return ENOMEM;
++	}
++	thread_deallocate(thread);
++	return 0;
++}
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -979,11 +979,11 @@
+ 	}
+ #endif /* DEVFS */
+ 
+-	/* polaris M4: mount the APFS partition read only, once there is a place to mount it */
++	/* polaris M4: mount the APFS partition read only, once the system has settled */
+ 	{
+-		extern int polaris_apfs_mount(void);
+-
+-		(void)polaris_apfs_mount();
++		extern int polaris_apfs_start(void);
++
++		(void)polaris_apfs_start();
+ 	}
+ 
+ #if CONFIG_BASESYSTEMROOT
