@@ -6027,3 +6027,48 @@ new file mode 100644
 +RedwoodGPUStart(void)
 +{
 +}
+diff --git a/bsd/sys/redwood_input.h b/bsd/sys/redwood_input.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/sys/redwood_input.h
+@@ -0,0 +1,40 @@
++/*
++ * polaris: the declarations bsd/dev/mi8_adreno.c (the Mi 8 A630 driver) expects from
++ * bsd/sys/redwood_input.h in the tree it came from.
++ *
++ * That file is HackiOS's input/GPU header and most of it is about drivers this port does
++ * not carry; this is only the part the GPU driver refers to.
++ */
++#ifndef _SYS_REDWOOD_INPUT_H_
++#define _SYS_REDWOOD_INPUT_H_
++
++#include <sys/types.h>
++#include <stdbool.h>
++
++/* bsd/dev/mi8_adreno.c */
++void mi8_adreno_init(void);         /* boot-arg mi8gpu=N: the first N steps of waking the GPU */
++void mi8_gpu_quiesce(void);         /* panic quiesce */
++void mi8_perf_kick(void);           /* wake dynamic CPU/DDR boost on GPU activity */
++
++/* The GPU kept on (boot-arg gpu=1): redwood_adreno.c hands the calls below over to these. */
++bool mi8_gpu_kept(void);
++bool mi8_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t mi8_gpu_address(uint64_t size);
++void mi8_gpu_address_free(uint64_t address, uint64_t size);
++void mi8_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes,
++    unsigned *most, uint64_t *lost, uint32_t *refused);
++bool mi8_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++bool mi8_gpu_map_range(uint64_t address, uint64_t phys, uint64_t size, bool read_only);
++void mi8_gpu_mapped(void);
++void mi8_gpu_unmap(uint64_t address, uint64_t size);
++void mi8_gpu_to_memory(void *start, uint64_t size);
++uint32_t mi8_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++bool mi8_gpu_done(uint32_t fence);
++uint32_t mi8_gpu_last(void);
++void mi8_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++void mi8_gpu_report(const char *why);
++bool mi8_gpu_recover(void);
++void mi8_gpu_stop(void);
++bool redwood_gpu_map_range(uint64_t address, uint64_t phys, uint64_t size, bool read_only);
++
++#endif /* _SYS_REDWOOD_INPUT_H_ */
