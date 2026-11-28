@@ -1,0 +1,35 @@
+diff --git a/bsd/miscfs/apfs/apfs_kmount.c b/bsd/miscfs/apfs/apfs_kmount.c
+--- a/bsd/miscfs/apfs/apfs_kmount.c
++++ b/bsd/miscfs/apfs/apfs_kmount.c
+@@ -21,6 +21,8 @@
+ #include <sys/proc.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -30,6 +32,9 @@
+ 
+ /* bsd/dev/sweet_ufs.c: makes the partition's device node, answers its path */
+ extern int sweet_ufs_apfs_node(const char *name, char *path, size_t pathlen);
++
++/* bsd/kern/kern_thread.c: not in a header this file can use */
++extern kern_return_t thread_terminate(thread_t thread);
+ 
+ /* How long to let the system settle before mounting (seconds). */
+ #define POLARIS_APFS_DELAY 15
+diff --git a/bsd/dev/mi8_adreno_support.c b/bsd/dev/mi8_adreno_support.c
+--- a/bsd/dev/mi8_adreno_support.c
++++ b/bsd/dev/mi8_adreno_support.c
+@@ -21,6 +21,9 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <libkern/libkern.h>
++
++/* the platform expert's mapping call, as mi8_adreno.c declares it too */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ /* their console log */
+ void
