@@ -1,0 +1,74 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 46fdeef..520b487 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -813,6 +813,55 @@ sweet_log_start(void)
+ 	}
+ }
+ 
++/*
++ * polaris P1d: read block 0 of a named partition and say whether it holds an APFS
++ * container superblock.  Read-only; the root partition mapping is put back at once,
++ * so this can run next to the root mount without disturbing it.
++ *
++ * Boot-arg: polarisapfs=<partition name>, e.g. polarisapfs=iosroot.
++ */
++static int
++sweet_ufs_apfs_peek(const char *want)
++{
++	uint64_t root_first = su.first_block, root_blocks = su.nblocks;
++	uint64_t first, blocks;
++	const uint8_t *b;
++	uint32_t block_size, i;
++	uint64_t block_count;
++	int error;
++
++	error = ufs_find_partition(want);
++	if (error) {
++		return error;
++	}
++	first = su.first_block;
++	blocks = su.nblocks;
++	su.first_block = root_first;
++	su.nblocks = root_blocks;
++
++	error = ufs_read_blocks(first, 1);
++	if (error) {
++		printf("POLARIS APFS: reading block 0 of \"%s\" failed: %d\n", want, error);
++		return error;
++	}
++	b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	if (memcmp(b + 32, "NXSB", 4) != 0) {
++		printf("POLARIS APFS: \"%s\" block %llu has no NXSB; first bytes", want, first);
++		for (i = 0; i < 8; i++) {
++			printf(" %02x", b[i]);
++		}
++		printf("\n");
++		return 0;
++	}
++	memcpy(&block_size, b + 36, 4);
++	memcpy(&block_count, b + 40, 8);
++	printf("POLARIS APFS: \"%s\" at block %llu (%llu MiB): NXSB block size %u, %llu blocks "
++	    "(%llu MiB), uuid %02x%02x%02x%02x...%02x%02x\n",
++	    want, first, blocks * UFS_BLOCK >> 20, block_size, block_count,
++	    (block_count * (uint64_t)block_size) >> 20, b[72], b[73], b[74], b[75], b[86], b[87]);
++	return 1;
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+@@ -825,6 +874,13 @@ sweet_ufs_rootdev(dev_t *dev)
+ 			return error;
+ 		}
+ 	}
++	{
++		char apfs[32] = "";
++
++		if (PE_parse_boot_argn("polarisapfs", apfs, sizeof(apfs)) && apfs[0] != 0) {
++			(void)sweet_ufs_apfs_peek(apfs);
++		}
++	}
+ 	*dev = su.bdev;
+ 	return 0;
+ }
