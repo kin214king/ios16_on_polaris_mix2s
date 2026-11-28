@@ -1,11 +1,11 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index e17b8ea..2dfa15e 100644
+index 4774b4b..b4d623f 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -165,6 +165,7 @@ bsd/miscfs/apfs/apfs_vnops.c		standard
- bsd/miscfs/apfs/apfs_write.c		standard
+@@ -166,6 +166,7 @@ bsd/miscfs/apfs/apfs_write.c		standard
  bsd/miscfs/apfs/apfs_deflate.c		standard
  bsd/miscfs/apfs/apfs_zbitmap.c		standard
+ bsd/miscfs/apfs/apfs_probe.c		standard
 +bsd/miscfs/apfs/apfs_kmount.c		standard
  
  bsd/miscfs/devfs/devfs_tree.c		optional devfs
