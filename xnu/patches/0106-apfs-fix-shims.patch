@@ -1,0 +1,204 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 15dfafc..e17b8ea 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -165,7 +165,6 @@ bsd/miscfs/apfs/apfs_vnops.c		standard
+ bsd/miscfs/apfs/apfs_write.c		standard
+ bsd/miscfs/apfs/apfs_deflate.c		standard
+ bsd/miscfs/apfs/apfs_zbitmap.c		standard
+-bsd/libkern/zlib_stub.c			standard
+ 
+ bsd/miscfs/devfs/devfs_tree.c		optional devfs
+ bsd/miscfs/devfs/devfs_vnops.c		optional devfs
+diff --git a/bsd/libkern/OSAtomic.h b/bsd/libkern/OSAtomic.h
+deleted file mode 100644
+index 74b2933..0000000
+--- a/bsd/libkern/OSAtomic.h
++++ /dev/null
+@@ -1,51 +0,0 @@
+-/*
+- * Minimal stand-in for <libkern/OSAtomic.h> (Darwin 26's header, absent from xnu-8796).
+- *
+- * The APFS port uses exactly two of its functions; both are one compiler builtin each.
+- * Kept here rather than in the APFS directory so that the include the ported sources
+- * carry (<libkern/OSAtomic.h>) resolves unchanged.
+- */
+-
+-#ifndef _BSD_LIBKERN_OSATOMIC_H_
+-#define _BSD_LIBKERN_OSATOMIC_H_
+-
+-#include <stdint.h>
+-#include <stdbool.h>
+-
+-static inline int32_t
+-OSIncrementAtomic(volatile int32_t *value)
+-{
+-	return __atomic_add_fetch(value, 1, __ATOMIC_SEQ_CST);
+-}
+-
+-static inline int32_t
+-OSDecrementAtomic(volatile int32_t *value)
+-{
+-	return __atomic_sub_fetch(value, 1, __ATOMIC_SEQ_CST);
+-}
+-
+-static inline int32_t
+-OSAddAtomic(int32_t amount, volatile int32_t *value)
+-{
+-	return __atomic_add_fetch(value, amount, __ATOMIC_SEQ_CST);
+-}
+-
+-static inline bool
+-OSCompareAndSwap(uint32_t old_value, uint32_t new_value, volatile uint32_t *value)
+-{
+-	uint32_t expected = old_value;
+-
+-	return __atomic_compare_exchange_n(value, &expected, new_value, false,
+-	    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+-}
+-
+-static inline bool
+-OSCompareAndSwap64(uint64_t old_value, uint64_t new_value, volatile uint64_t *value)
+-{
+-	uint64_t expected = old_value;
+-
+-	return __atomic_compare_exchange_n(value, &expected, new_value, false,
+-	    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+-}
+-
+-#endif /* _BSD_LIBKERN_OSATOMIC_H_ */
+diff --git a/bsd/libkern/zlib.h b/bsd/libkern/zlib.h
+deleted file mode 100644
+index 9efe5c3..0000000
+--- a/bsd/libkern/zlib.h
++++ /dev/null
+@@ -1,62 +0,0 @@
+-/*
+- * A stand-in for <libkern/zlib.h>, which xnu-8796 does not have.
+- *
+- * apfs_lib.c keeps zlib as the fallback for a decmpfs stream libdeflate will not take:
+- * it fills a z_stream and calls inflateInit/inflate/inflateEnd.  Here those exist but
+- * decompress nothing (inflate answers Z_DATA_ERROR), so such a stream is reported as
+- * unreadable instead of being decoded.  Files that libdeflate handles -- every ordinary
+- * one -- are unaffected.  Replacing this with real zlib is a later step; see the port's
+- * notes.
+- */
+-
+-#ifndef _BSD_LIBKERN_ZLIB_H_
+-#define _BSD_LIBKERN_ZLIB_H_
+-
+-#include <stdint.h>
+-#include <stddef.h>
+-
+-typedef unsigned char Bytef;
+-typedef unsigned int uInt;
+-typedef unsigned long uLong;
+-typedef void *voidpf;
+-
+-typedef voidpf (*alloc_func)(voidpf opaque, uInt items, uInt size);
+-typedef void (*free_func)(voidpf opaque, voidpf address);
+-
+-typedef struct z_stream_s {
+-	Bytef *next_in;
+-	uInt avail_in;
+-	uLong total_in;
+-	Bytef *next_out;
+-	uInt avail_out;
+-	uLong total_out;
+-	char *msg;
+-	void *state;
+-	alloc_func zalloc;
+-	free_func zfree;
+-	voidpf opaque;
+-	int data_type;
+-	uLong adler;
+-	uLong reserved;
+-} z_stream, *z_streamp;
+-
+-#define Z_NULL          0
+-#define Z_NO_FLUSH      0
+-#define Z_FINISH        4
+-#define Z_OK            0
+-#define Z_STREAM_END    1
+-#define Z_NEED_DICT     2
+-#define Z_ERRNO         (-1)
+-#define Z_STREAM_ERROR  (-2)
+-#define Z_DATA_ERROR    (-3)
+-#define Z_MEM_ERROR     (-4)
+-#define Z_BUF_ERROR     (-5)
+-#define Z_VERSION_ERROR (-6)
+-
+-extern int inflateInit_(z_stream *strm, const char *version, int stream_size);
+-extern int inflate(z_stream *strm, int flush);
+-extern int inflateEnd(z_stream *strm);
+-
+-#define inflateInit(strm) inflateInit_((strm), "1.2.12", (int)sizeof(z_stream))
+-
+-#endif /* _BSD_LIBKERN_ZLIB_H_ */
+diff --git a/bsd/libkern/zlib_stub.c b/bsd/libkern/zlib_stub.c
+deleted file mode 100644
+index b670dfd..0000000
+--- a/bsd/libkern/zlib_stub.c
++++ /dev/null
+@@ -1,42 +0,0 @@
+-/*
+- * The <libkern/zlib.h> stand-in's only translation unit (see zlib.h).
+- *
+- * Nothing is decompressed: init succeeds so the caller's error path is exercised, and
+- * inflate reports a data error.  apfs_lib.c counts these and falls back no further.
+- */
+-
+-#include <libkern/zlib.h>
+-
+-int
+-inflateInit_(z_stream *strm, const char *version, int stream_size)
+-{
+-	(void)version;
+-	(void)stream_size;
+-	if (strm == NULL) {
+-		return Z_STREAM_ERROR;
+-	}
+-	strm->total_in = 0;
+-	strm->total_out = 0;
+-	strm->state = NULL;
+-	return Z_OK;
+-}
+-
+-int
+-inflate(z_stream *strm, int flush)
+-{
+-	(void)flush;
+-	if (strm == NULL) {
+-		return Z_STREAM_ERROR;
+-	}
+-	return Z_DATA_ERROR;
+-}
+-
+-int
+-inflateEnd(z_stream *strm)
+-{
+-	if (strm == NULL) {
+-		return Z_STREAM_ERROR;
+-	}
+-	strm->state = NULL;
+-	return Z_OK;
+-}
+diff --git a/bsd/miscfs/apfs/apfs_deflate.c b/bsd/miscfs/apfs/apfs_deflate.c
+index 013a543..38a5e54 100644
+--- a/bsd/miscfs/apfs/apfs_deflate.c
++++ b/bsd/miscfs/apfs/apfs_deflate.c
+@@ -17,6 +17,14 @@
+  */
+ #define FREESTANDING 1
+ 
++/*
++ * The kernel's include path has no <arm_neon.h>, so libdeflate's NEON paths are
++ * switched off here and its portable C is used instead (slower, same results).
++ */
++#if defined(__ARM_NEON)
++#undef __ARM_NEON
++#endif
++
+ #include "libdeflate/lib/deflate_decompress.c"
+ #include "libdeflate/lib/zlib_decompress.c"
+ #include "libdeflate/lib/adler32.c"
